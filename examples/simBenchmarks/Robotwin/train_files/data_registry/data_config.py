@@ -79,6 +79,31 @@ class AgilexData50Config(AgilexDataConfig):
         ])
 
 
+# Aggregate Clean50 uses every converted transition exactly once per epoch.
+class RobotwinClean50DataConfig(AgilexDataConfig):
+    action_indices = list(range(32))
+
+    def modality_config(self):
+        return {
+            "video": ModalityConfig(delta_indices=self.observation_indices, modality_keys=self.video_keys),
+            "action": ModalityConfig(delta_indices=self.action_indices, modality_keys=self.action_keys),
+            "language": ModalityConfig(delta_indices=self.observation_indices, modality_keys=self.language_keys),
+        }
+
+    def transform(self):
+        return ComposedModalityTransform(transforms=[
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                binary_threshold=0.49,
+                normalization_modes={
+                    "action.left_joints": "min_max", "action.right_joints": "min_max",
+                    "action.left_gripper": "binary", "action.right_gripper": "binary",
+                },
+            ),
+        ])
+
+
 # ---------------------------------------------------------------------------
 # DataConfig — ARX X5
 # ---------------------------------------------------------------------------
@@ -123,6 +148,7 @@ class ArxX5DataConfig:
 ROBOT_TYPE_CONFIG_MAP = {
     "robotwin": AgilexDataConfig(),
     "robotwin50": AgilexData50Config(),
+    "robotwin_clean50": RobotwinClean50DataConfig(),
     "arx_x5": ArxX5DataConfig(),
 }
 
@@ -136,6 +162,7 @@ ROBOT_TYPE_TO_EMBODIMENT_TAG = {
 # Mixtures
 # ---------------------------------------------------------------------------
 DATASET_NAMED_MIXTURES = {
+    "robotwin_clean50": [("robotwin_clean50", 1.0, "robotwin_clean50")],
     "robotwin_all": [
         ("Clean/adjust_bottle", 1.0, "robotwin"), ("Randomized/adjust_bottle", 1.0, "robotwin"),
         ("Clean/beat_block_hammer", 1.0, "robotwin"), ("Randomized/beat_block_hammer", 1.0, "robotwin"),

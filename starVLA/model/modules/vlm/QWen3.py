@@ -49,7 +49,7 @@ class _QWen3_VL_Interface(nn.Module):
 
         qwenvl_config = config.framework.get("qwenvl", {})
         model_id = qwenvl_config.get("base_vlm", "Qwen/Qwen3-VL-4B-Instruct")
-        attn_implementation = qwenvl_config.get("attn_implementation", "sdpa")
+        requested_attn_implementation = qwenvl_config.get("attn_implementation", "sdpa")
         attn_implementation = "sdpa"
         # Fallback to sdpa if flash_attention_2 is requested but flash_attn is not installed
         if attn_implementation == "flash_attention_2":
@@ -69,6 +69,16 @@ class _QWen3_VL_Interface(nn.Module):
         self.model = model
         self.processor = processor
         self.config = config
+        self.requested_attn_implementation = requested_attn_implementation
+        self.resolved_attn_implementation = attn_implementation
+
+        self.gradient_checkpointing_enabled = bool(qwenvl_config.get("gradient_checkpointing", False))
+        if self.gradient_checkpointing_enabled:
+            self.model.config.use_cache = False
+            self.model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+            self.model.enable_input_require_grads()
 
         # alin qwen3 with qwen2.5
         self.model.config.hidden_size = self.model.config.text_config.hidden_size

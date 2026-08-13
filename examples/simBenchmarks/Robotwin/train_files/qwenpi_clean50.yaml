@@ -1,0 +1,67 @@
+run_id: ${oc.env:RUN_ID}
+run_root_dir: /mnt/data/users/bowen/workspace/ckpt
+seed: 42
+wandb_entity: ${oc.env:WANDB_ENTITY}
+wandb_project: ${oc.env:WANDB_PROJECT,starVLA_Robotwin_Clean50}
+is_debug: false
+version_id: "0.21"
+
+framework:
+  name: QwenPI
+  qwenvl:
+    base_vlm: ${oc.env:QWEN3_VL_SNAPSHOT}
+    attn_implementation: sdpa
+    gradient_checkpointing: true
+  action_model:
+    action_dim: 14
+    action_horizon: 32
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    data_root_dir: ${oc.env:ROBOTWIN_OVERLAY_ROOT}
+    data_mix: robotwin_clean50
+    action_type: abs_qpos
+    action_mode: abs
+    include_state: false
+    aggregate_transition_shuffle: true
+    strict_data_errors: true
+    balance_dataset_weights: false
+    balance_trajectory_weights: false
+    per_device_batch_size: 16
+    drop_last: true
+    num_workers: 4
+    persistent_workers: false
+    prefetch_factor: 2
+    pin_memory: true
+    obs_image_size: [224, 224]
+    video_backend: pyav
+    lerobot_version: v2.0
+
+trainer:
+  max_train_steps: 30000
+  num_warmup_steps: 5000
+  save_interval: 10000
+  eval_interval: 0
+  logging_frequency: 50
+  learning_rate:
+    base: 3.0e-05
+    qwen_vl_interface: 1.0e-05
+    action_model: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  freeze_modules: ""
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 2
+  strict_contract: true
+  wandb_required: true
+  full_state_checkpoints: true
+  validate_checkpoint: false
+  save_final_model: false
+  is_resume: false
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08

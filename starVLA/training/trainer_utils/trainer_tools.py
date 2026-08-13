@@ -337,7 +337,9 @@ class TrainerUtils:
         # 1. update epoch counter
         epoch_counter += 1
 
-        # 2. set new epoch (distributed core)
+        # 2. update both dataset order and distributed sampler partitioning
+        if hasattr(dataloader, "dataset") and callable(getattr(dataloader.dataset, "set_epoch", None)):
+            dataloader.dataset.set_epoch(epoch_counter)
         if hasattr(dataloader, "sampler") and callable(getattr(dataloader.sampler, "set_epoch", None)):
             dataloader.sampler.set_epoch(epoch_counter)
 

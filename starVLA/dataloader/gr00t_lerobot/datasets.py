@@ -1064,12 +1064,16 @@ class LeRobotSingleDataset(Dataset):
 
                     language_instruction = self.get_language(trajectory_id, self.modality_keys['language'][0], 0)
                     if not language_instruction or language_instruction[0] == "":
+                        if self.data_cfg is not None and self.data_cfg.get("strict_data_errors", False):
+                            raise ValueError(f"Empty language instruction in trajectory {trajectory_id}")
                         print(f"Skipping trajectory {trajectory_id} due to empty language instruction")
                         skipped_trajectories += 1
                         trajectory_skipped = True
                         continue
 
             except Exception as e:
+                if self.data_cfg is not None and self.data_cfg.get("strict_data_errors", False):
+                    raise RuntimeError(f"Failed to index trajectory {trajectory_id}") from e
                 print(f"Skipping trajectory {trajectory_id} due to read error: {e}")
                 skipped_trajectories += 1
                 trajectory_skipped = True
@@ -2205,6 +2209,11 @@ class LeRobotMixtureDataset(Dataset):
         self.seed = seed
         self.mode = mode
         self.data_cfg = kwargs["data_cfg"] if "data_cfg" in kwargs else None
+        self.aggregate_transition_shuffle = bool(
+            self.data_cfg is not None and self.data_cfg.get("aggregate_transition_shuffle", False)
+        )
+        if self.aggregate_transition_shuffle and len(datasets) != 1:
+            raise ValueError("aggregate_transition_shuffle requires exactly one aggregate dataset")
 
         # Set properties for sampling
 
@@ -2314,10 +2323,18 @@ class LeRobotMixtureDataset(Dataset):
             epoch (int): The epoch to set.
         """
         self.epoch = epoch
-        # self.sampled_steps = self.sample_epoch()
+        for dataset in self.datasets:
+            dataset.set_epoch(epoch)
+        if self.aggregate_transition_shuffle:
+            rng = np.random.default_rng(safe_hash((self.seed, epoch)))
+            self.transition_permutation = rng.permutation(len(self.datasets[0]))
 
     def sample_step(self, index: int) -> tuple[LeRobotSingleDataset, int, int]:
         """Sample a single step from the dataset."""
+        if self.aggregate_transition_shuffle:
+            dataset = self.datasets[0]
+            trajectory_id, base_index = dataset.all_steps[int(self.transition_permutation[index])]
+            return dataset, trajectory_id, base_index
         # return self.sampled_steps[index]
 
         # Set seed
@@ -2349,6 +2366,10 @@ class LeRobotMixtureDataset(Dataset):
         Returns:
             dict: The data for the trajectory and start index.
         """
+        if self.aggregate_transition_shuffle:
+            dataset = self.datasets[0]
+            return dataset[int(self.transition_permutation[index])]
+
         self._getitem_count += 1
         if self._getitem_count % 1000 == 0:
             gc.collect()
@@ -2409,6 +2430,9 @@ class LeRobotMixtureDataset(Dataset):
         Returns:
             int: The length of a single epoch in the mixture.
         """
+        if self.aggregate_transition_shuffle:
+            return len(self.datasets[0])
+
         # Check for potential issues
         if len(self.datasets) == 0:
             return 0
