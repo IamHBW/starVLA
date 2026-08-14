@@ -1,4 +1,5 @@
 from collections import deque
+from pathlib import Path
 from typing import Dict, Optional
 
 import cv2 as cv
@@ -67,6 +68,14 @@ class ModelClient:
         self.raw_actions = None
 
         server_meta = self.client.get_server_metadata()
+        server_checkpoint = server_meta.get("ckpt_path")
+        if server_checkpoint is None:
+            raise RuntimeError("StarVLA server metadata has no ckpt_path.")
+        if Path(str(server_checkpoint)).stem != Path(str(policy_ckpt_path)).stem:
+            raise RuntimeError(
+                "StarVLA server checkpoint mismatch: "
+                f"expected={policy_ckpt_path}, actual={server_checkpoint}"
+            )
         self.action_chunk_size = server_meta["action_chunk_size"]
         print(
             f"*** policy_setup: {policy_setup}, unnorm_key: {unnorm_key}, "

@@ -219,8 +219,8 @@ def _build_dataset_metadata(
 
     action_stats, action_meta = _split_combined(action_combined, action_keys, action_key_dims)
 
-    statistics: Dict[str, Any] = {"action": action_stats}
-    modalities: Dict[str, Any] = {"video": {}, "action": action_meta}
+    statistics: Dict[str, Any] = {"state": {}, "action": action_stats}
+    modalities: Dict[str, Any] = {"video": {}, "state": {}, "action": action_meta}
     if state_combined:
         state_stats, state_meta = _split_combined(state_combined, state_keys, state_key_dims)
         statistics["state"] = state_stats

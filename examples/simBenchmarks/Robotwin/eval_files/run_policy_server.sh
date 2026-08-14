@@ -2,18 +2,19 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
 
 export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 
 if [[ $# -lt 1 ]]; then
-    echo "Usage: bash examples/simBenchmarks/Robotwin/eval_files/run_policy_server.sh <ckpt_path> [gpu_id] [port]" >&2
+    echo "Usage: bash examples/simBenchmarks/Robotwin/eval_files/run_policy_server.sh <ckpt_path> [gpu_id] [port] [host]" >&2
     exit 1
 fi
 
 your_ckpt="$1"
 gpu_id="${2:-${ROBOTWIN_SERVER_GPU:-0}}"
 port="${3:-${ROBOTWIN_SERVER_PORT:-5694}}"
+host="${4:-${ROBOTWIN_SERVER_HOST:-127.0.0.1}}"
 star_vla_python="${STARVLA_PYTHON:-${star_vla_python:-python}}"
 
 use_bf16_flag=()
@@ -25,8 +26,11 @@ echo "[INFO] Starting RoboTwin policy server"
 echo "[INFO] checkpoint: ${your_ckpt}"
 echo "[INFO] gpu: ${gpu_id}"
 echo "[INFO] port: ${port}"
+echo "[INFO] host: ${host}"
 
 CUDA_VISIBLE_DEVICES="${gpu_id}" "${star_vla_python}" "${REPO_ROOT}/deployment/model_server/server_policy.py" \
     --ckpt_path "${your_ckpt}" \
+    --host "${host}" \
     --port "${port}" \
+    --idle_timeout "${ROBOTWIN_SERVER_IDLE_TIMEOUT:-1800}" \
     "${use_bf16_flag[@]}"

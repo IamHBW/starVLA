@@ -58,6 +58,7 @@ ROBOTWIN_ALL_TASKS=(
 
 used_ports=()
 SLOT_GPUS=()
+SLOT_HOSTS=()
 SLOT_PORTS=()
 ACTIVE_PIDS=()
 ACTIVE_TASKS=()
@@ -113,12 +114,13 @@ trap cleanup_active_jobs EXIT INT TERM
 usage() {
     cat >&2 <<'EOF'
 Usage:
-  bash start_eval.sh -m <mode> -n <policy_name> -c <ckpt_path> [options] <tasks...>
+  bash start_eval.sh -m <mode> -n <policy_name> (-c <ckpt_path> | --remote-manifest <path>) [options] <tasks...>
 
 Required flags:
   -m, --mode              Eval mode: demo_clean or demo_randomized
   -n, --name              Policy name (used for log directory naming)
-  -c, --ckpt              Path to the checkpoint file
+  -c, --ckpt              Local mode: path to the checkpoint file
+      --remote-manifest   Remote mode: 8-slot server_manifest.json
 
 Tasks (positional):
   Remaining arguments after flags are treated as task names, the keyword
@@ -126,6 +128,7 @@ Tasks (positional):
 
 Optional flags:
   -s, --seed              Eval seed (default: 0, env: ROBOTWIN_SEED)
+  -e, --episodes          Episodes per task (local default: 100; remote manifest: 20)
   -j, --jobs-per-gpu      Concurrent jobs per GPU (default: 1, env: ROBOTWIN_JOBS_PER_GPU)
   -p, --base-port         First port to allocate (default: 5694, env: ROBOTWIN_BASE_PORT)
       --server-timeout    Seconds to wait for server (default: 600, env: ROBOTWIN_SERVER_TIMEOUT)
@@ -144,6 +147,7 @@ Environment variables (lower priority than flags):
   ROBOTWIN_ENV               Conda env name for RoboTwin eval (default: robotwin)
   STARVLA_PYTHON             Explicit python path for starvla (skips conda env lookup)
   ROBOTWIN_PYTHON            Explicit python path for robotwin (skips conda env lookup)
+  ROBOTWIN_REMOTE_CLIENT_GPU GPU used by all remote simulation clients (default: 0)
 EOF
 }
 
@@ -207,6 +211,72 @@ wait_for_server() {
     local elapsed=0
     while (( elapsed < timeout_s )); do
         if port_in_use "${port}"; then
+            return 0
+        fi
+        sleep 2
+        elapsed=$((elapsed + 2))
+    done
+    return 1
+}
+
+load_remote_manifest() {
+    "${ROBOTWIN_PYTHON}" - "$1" <<'PY'
+import json
+import os
+import sys
+
+path = sys.argv[1]
+with open(path, "r", encoding="utf-8") as file:
+    payload = json.load(file)
+if payload.get("backend") != "starvla":
+    raise SystemExit(f"Expected a starvla server manifest: {path}")
+if payload.get("evaluation_instruction_type") != "unseen":
+    raise SystemExit("Remote manifest must explicitly require unseen instructions")
+evaluation = payload.get("evaluation")
+if not isinstance(evaluation, dict) or int(evaluation.get("episodes_per_task_phase", 0)) != 20:
+    raise SystemExit("Remote manifest must require 20 episodes per task and phase")
+checkpoint = payload.get("checkpoint")
+if not isinstance(checkpoint, dict):
+    raise SystemExit("Remote manifest is missing checkpoint metadata")
+checkpoint_id = str(checkpoint.get("id") or os.path.basename(str(checkpoint.get("path", "")))).strip()
+if not checkpoint_id:
+    raise SystemExit("Remote manifest checkpoint must contain id or path")
+slots = payload.get("slots")
+if not isinstance(slots, list) or len(slots) != 8:
+    raise SystemExit("Remote manifest must contain exactly 8 slots")
+slots = sorted(slots, key=lambda item: int(item["slot"]))
+if [int(item["slot"]) for item in slots] != list(range(8)):
+    raise SystemExit("Remote manifest slot ids must be exactly 0..7")
+endpoints = []
+print(f"checkpoint\t{checkpoint_id}")
+print("episodes\t20")
+for item in slots:
+    host = str(item.get("client_host", "")).strip()
+    port = int(item.get("client_port", 0))
+    if not host or not 1 <= port <= 65535:
+        raise SystemExit(f"Invalid endpoint for slot {item.get('slot')}: {host}:{port}")
+    endpoint = (host, port)
+    if endpoint in endpoints:
+        raise SystemExit(f"Duplicate remote endpoint: {host}:{port}")
+    endpoints.append(endpoint)
+    print(f"slot\t{int(item['slot'])}\t{host}\t{port}")
+PY
+}
+
+wait_for_remote_server() {
+    local host="$1"
+    local port="$2"
+    local timeout_s="${3:-120}"
+    local elapsed=0
+    while (( elapsed < timeout_s )); do
+        if "${ROBOTWIN_PYTHON}" - "${host}" "${port}" <<'PY' 2>/dev/null
+import socket
+import sys
+
+with socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=2):
+    pass
+PY
+        then
             return 0
         fi
         sleep 2
@@ -348,6 +418,7 @@ launch_task_in_slot() {
     local slot_idx="$1"
     local task_name="$2"
     local gpu_id="${SLOT_GPUS[$slot_idx]}"
+    local host="${SLOT_HOSTS[$slot_idx]:-127.0.0.1}"
     local port="${SLOT_PORTS[$slot_idx]}"
     local launched_pid=""
     local task_safe="${task_name//\//_}"
@@ -356,6 +427,30 @@ launch_task_in_slot() {
     local eval_log="${LOG_DIR}/${task_safe}_${TASK_CONFIG}_${slot_label}_eval.log"
 
     echo "[INFO] Launching task=${task_name} mode=${TASK_CONFIG} gpu=${gpu_id} port=${port}"
+
+    if ${REMOTE_MODE}; then
+        (
+            set -euo pipefail
+            cd "${SCRIPT_DIR}"
+            bash "${SCRIPT_DIR}/eval.sh" \
+                "${task_name}" \
+                "${TASK_CONFIG}" \
+                "${POLICY_NAME}" \
+                "${ROBOTWIN_SEED:-0}" \
+                "${gpu_id}" \
+                "${CKPT_PATH}" \
+                "${port}" \
+                "${host}" \
+                "${ROBOTWIN_EVAL_NUM_EPISODES}" \
+                > >(tee "${eval_log}" | grep --line-buffered "Success rate" | sed -u "s/^/[RESULT] ${task_name}: /") 2>&1
+        ) &
+        launched_pid=$!
+        ACTIVE_PIDS[$slot_idx]="${launched_pid}"
+        ACTIVE_TASKS[$slot_idx]="${task_name}"
+        ACTIVE_SERVER_LOGS[$slot_idx]="${REMOTE_MANIFEST}"
+        ACTIVE_EVAL_LOGS[$slot_idx]="${eval_log}"
+        return
+    fi
 
     (
         set -euo pipefail
@@ -390,6 +485,8 @@ launch_task_in_slot() {
             "${gpu_id}" \
             "${CKPT_PATH}" \
             "${port}" \
+            "127.0.0.1" \
+            "${ROBOTWIN_EVAL_NUM_EPISODES}" \
             > >(tee "${eval_log}" | grep --line-buffered "Success rate" | sed -u "s/^/[RESULT] ${task_name}: /") 2>&1
     ) &
 
@@ -405,7 +502,10 @@ launch_task_in_slot() {
 TASK_CONFIG=""
 POLICY_NAME=""
 CKPT_PATH=""
+REMOTE_MANIFEST=""
+REMOTE_MODE=false
 opt_seed=""
+opt_episodes=""
 opt_jobs=""
 opt_port=""
 opt_timeout=""
@@ -416,7 +516,9 @@ while (( $# > 0 )); do
         -m|--mode)          TASK_CONFIG="$2"; shift 2 ;;
         -n|--name)          POLICY_NAME="$2"; shift 2 ;;
         -c|--ckpt)          CKPT_PATH="$2"; shift 2 ;;
+        --remote-manifest)  REMOTE_MANIFEST="$2"; shift 2 ;;
         -s|--seed)          opt_seed="$2"; shift 2 ;;
+        -e|--episodes)      opt_episodes="$2"; shift 2 ;;
         -j|--jobs-per-gpu)  opt_jobs="$2"; shift 2 ;;
         -p|--base-port)     opt_port="$2"; shift 2 ;;
         --server-timeout)   opt_timeout="$2"; shift 2 ;;
@@ -427,8 +529,8 @@ while (( $# > 0 )); do
     esac
 done
 
-if [[ -z "${TASK_CONFIG}" || -z "${POLICY_NAME}" || -z "${CKPT_PATH}" ]]; then
-    echo "Missing required flags: -m/--mode, -n/--name, -c/--ckpt" >&2
+if [[ -z "${TASK_CONFIG}" || -z "${POLICY_NAME}" ]]; then
+    echo "Missing required flags: -m/--mode and -n/--name" >&2
     usage
     exit 1
 fi
@@ -438,8 +540,24 @@ if [[ "${TASK_CONFIG}" != "demo_clean" && "${TASK_CONFIG}" != "demo_randomized" 
     exit 1
 fi
 
-if [[ ! -f "${CKPT_PATH}" ]]; then
+if [[ -n "${CKPT_PATH}" && -n "${REMOTE_MANIFEST}" ]]; then
+    echo "Use either --ckpt or --remote-manifest, not both." >&2
+    exit 1
+fi
+if [[ -z "${CKPT_PATH}" && -z "${REMOTE_MANIFEST}" ]]; then
+    echo "Missing model source: pass --ckpt or --remote-manifest." >&2
+    exit 1
+fi
+if [[ -n "${CKPT_PATH}" && ! -f "${CKPT_PATH}" ]]; then
     echo "Checkpoint path does not exist: ${CKPT_PATH}" >&2
+    exit 1
+fi
+if [[ -n "${REMOTE_MANIFEST}" && ! -f "${REMOTE_MANIFEST}" ]]; then
+    echo "Remote manifest does not exist: ${REMOTE_MANIFEST}" >&2
+    exit 1
+fi
+if [[ -z "${ROBOTWIN_PATH:-}" ]]; then
+    echo "ROBOTWIN_PATH must point to your own RoboTwin checkout." >&2
     exit 1
 fi
 
@@ -450,6 +568,11 @@ if (( $# == 0 )); then
 fi
 
 ROBOTWIN_SEED="${opt_seed:-${ROBOTWIN_SEED:-0}}"
+ROBOTWIN_EVAL_NUM_EPISODES="${opt_episodes:-${ROBOTWIN_EVAL_NUM_EPISODES:-100}}"
+if [[ ! "${ROBOTWIN_EVAL_NUM_EPISODES}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "--episodes must be a positive integer: ${ROBOTWIN_EVAL_NUM_EPISODES}" >&2
+    exit 1
+fi
 ROBOTWIN_JOBS_PER_GPU="${opt_jobs:-${ROBOTWIN_JOBS_PER_GPU:-1}}"
 ROBOTWIN_BASE_PORT="${opt_port:-${ROBOTWIN_BASE_PORT:-5694}}"
 ROBOTWIN_SERVER_TIMEOUT="${opt_timeout:-${ROBOTWIN_SERVER_TIMEOUT:-600}}"
@@ -457,19 +580,51 @@ if ${opt_install}; then
     ROBOTWIN_AUTO_INSTALL_DEPS=1
 fi
 
-STARVLA_PYTHON="$(resolve_python "${STARVLA_PYTHON:-}" "${ROBOTWIN_STARVLA_ENV:-starvla}")"
 ROBOTWIN_PYTHON="$(resolve_python "${ROBOTWIN_PYTHON:-}" "${ROBOTWIN_ENV:-robotwin}")"
+if [[ -n "${REMOTE_MANIFEST}" ]]; then
+    REMOTE_MODE=true
+    STARVLA_PYTHON=""
+else
+    STARVLA_PYTHON="$(resolve_python "${STARVLA_PYTHON:-}" "${ROBOTWIN_STARVLA_ENV:-starvla}")"
+fi
 export STARVLA_PYTHON ROBOTWIN_PYTHON
 
 echo "[INFO] starvla python: ${STARVLA_PYTHON}"
 echo "[INFO] robotwin python: ${ROBOTWIN_PYTHON}"
 
 mapfile -t TASKS < <(resolve_tasks "$@")
-mapfile -t CUDA_DEVICES < <(detect_cuda_devices)
-
-NUM_GPUS=${#CUDA_DEVICES[@]}
-JOBS_PER_GPU="${ROBOTWIN_JOBS_PER_GPU}"
-TOTAL_SLOTS=$((NUM_GPUS * JOBS_PER_GPU))
+if ${REMOTE_MODE}; then
+    mapfile -t manifest_lines < <(load_remote_manifest "${REMOTE_MANIFEST}")
+    IFS=$'\t' read -r record_type CKPT_PATH <<< "${manifest_lines[0]}"
+    if [[ "${record_type}" != "checkpoint" ]]; then
+        echo "Invalid remote manifest output." >&2
+        exit 1
+    fi
+    IFS=$'\t' read -r record_type manifest_episodes <<< "${manifest_lines[1]}"
+    if [[ "${record_type}" != "episodes" || "${manifest_episodes}" != "20" ]]; then
+        echo "Invalid remote manifest episode count." >&2
+        exit 1
+    fi
+    if [[ -n "${opt_episodes}" ]]; then
+        ROBOTWIN_EVAL_NUM_EPISODES="${opt_episodes}"
+    else
+        ROBOTWIN_EVAL_NUM_EPISODES="${manifest_episodes}"
+    fi
+    for line in "${manifest_lines[@]:2}"; do
+        IFS=$'\t' read -r record_type slot_id host port <<< "${line}"
+        SLOT_GPUS+=("${ROBOTWIN_REMOTE_CLIENT_GPU:-0}")
+        SLOT_HOSTS+=("${host}")
+        SLOT_PORTS+=("${port}")
+    done
+    TOTAL_SLOTS=${#SLOT_PORTS[@]}
+    CUDA_DEVICES=("${ROBOTWIN_REMOTE_CLIENT_GPU:-0}")
+    JOBS_PER_GPU="${TOTAL_SLOTS}"
+else
+    mapfile -t CUDA_DEVICES < <(detect_cuda_devices)
+    NUM_GPUS=${#CUDA_DEVICES[@]}
+    JOBS_PER_GPU="${ROBOTWIN_JOBS_PER_GPU}"
+    TOTAL_SLOTS=$((NUM_GPUS * JOBS_PER_GPU))
+fi
 TOTAL_TASKS=${#TASKS[@]}
 BASE_PORT="${ROBOTWIN_BASE_PORT}"
 
@@ -478,27 +633,43 @@ if (( TOTAL_SLOTS <= 0 )); then
     exit 1
 fi
 
-check_port_detection
-
-prepare_runtime_dependencies
+if ${REMOTE_MODE}; then
+    for (( slot_idx = 0; slot_idx < TOTAL_SLOTS; ++slot_idx )); do
+        if ! wait_for_remote_server "${SLOT_HOSTS[$slot_idx]}" "${SLOT_PORTS[$slot_idx]}" "${ROBOTWIN_SERVER_TIMEOUT}"; then
+            echo "[ERROR] Remote policy endpoint is unreachable: ${SLOT_HOSTS[$slot_idx]}:${SLOT_PORTS[$slot_idx]}" >&2
+            exit 1
+        fi
+    done
+else
+    check_port_detection
+    prepare_runtime_dependencies
+fi
 
 ckpt_name="$(basename "${CKPT_PATH}")"
 ckpt_stem="${ckpt_name%.*}"
 timestamp="$(date +%Y%m%d_%H%M%S)"
-LOG_DIR="${ROBOTWIN_LOG_ROOT:-$(dirname "${CKPT_PATH}")/robotwin_eval_logs/${POLICY_NAME}_${TASK_CONFIG}_${ckpt_stem}_${timestamp}}"
+if ${REMOTE_MODE}; then
+    LOG_DIR="${ROBOTWIN_LOG_ROOT:-${ROBOTWIN_PATH}/eval_result/distributed_logs/${POLICY_NAME}_${TASK_CONFIG}_${ckpt_stem}_${timestamp}}"
+else
+    LOG_DIR="${ROBOTWIN_LOG_ROOT:-$(dirname "${CKPT_PATH}")/robotwin_eval_logs/${POLICY_NAME}_${TASK_CONFIG}_${ckpt_stem}_${timestamp}}"
+fi
 mkdir -p "${LOG_DIR}"
 
-next_port="${BASE_PORT}"
-for gpu_id in "${CUDA_DEVICES[@]}"; do
-    for (( slot_repeat = 0; slot_repeat < JOBS_PER_GPU; ++slot_repeat )); do
-        assigned_port="$(find_available_port "${next_port}")"
-        SLOT_GPUS+=("${gpu_id}")
-        SLOT_PORTS+=("${assigned_port}")
-        next_port=$((assigned_port + 1))
+if ! ${REMOTE_MODE}; then
+    next_port="${BASE_PORT}"
+    for gpu_id in "${CUDA_DEVICES[@]}"; do
+        for (( slot_repeat = 0; slot_repeat < JOBS_PER_GPU; ++slot_repeat )); do
+            assigned_port="$(find_available_port "${next_port}")"
+            SLOT_GPUS+=("${gpu_id}")
+            SLOT_HOSTS+=("127.0.0.1")
+            SLOT_PORTS+=("${assigned_port}")
+            next_port=$((assigned_port + 1))
+        done
     done
-done
+fi
 
 echo "[INFO] mode=${TASK_CONFIG}  name=${POLICY_NAME}  seed=${ROBOTWIN_SEED}"
+echo "[INFO] episodes=${ROBOTWIN_EVAL_NUM_EPISODES}"
 echo "[INFO] ckpt=${CKPT_PATH}"
 echo "[INFO] logs=${LOG_DIR}"
 echo "[INFO] gpus=$(join_arr ',' "${CUDA_DEVICES[@]}")  jobs_per_gpu=${JOBS_PER_GPU}  slots=${TOTAL_SLOTS}"

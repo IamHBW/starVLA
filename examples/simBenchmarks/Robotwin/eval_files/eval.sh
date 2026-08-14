@@ -2,14 +2,18 @@
 set -euo pipefail
 
 if [[ $# -lt 6 ]]; then
-    echo "Usage: bash examples/simBenchmarks/Robotwin/eval_files/eval.sh <task_name> <task_config> <ckpt_setting> <seed> <gpu_id> <policy_ckpt_path> [policy_port] [policy_host]" >&2
+    echo "Usage: bash examples/simBenchmarks/Robotwin/eval_files/eval.sh <task_name> <task_config> <ckpt_setting> <seed> <gpu_id> <policy_ckpt_path> [policy_port] [policy_host] [eval_num_episodes]" >&2
     exit 1
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
 
-ROBOTWIN_PATH="${ROBOTWIN_PATH:-/mnt/data/gaoning/code_repos/RoboTwin}"
+ROBOTWIN_PATH="${ROBOTWIN_PATH:-}"
+if [[ -z "${ROBOTWIN_PATH}" ]]; then
+    echo "ROBOTWIN_PATH must point to your own RoboTwin checkout." >&2
+    exit 1
+fi
 if [[ ! -d "${ROBOTWIN_PATH}" ]]; then
     echo "ROBOTWIN_PATH does not exist: ${ROBOTWIN_PATH}" >&2
     exit 1
@@ -49,7 +53,19 @@ gpu_id="${5:-0}"
 policy_ckpt_path="$6"
 policy_port="${7:-${ROBOTWIN_POLICY_PORT:-5694}}"
 policy_host="${8:-${ROBOTWIN_POLICY_HOST:-127.0.0.1}}"
+eval_num_episodes="${9:-${ROBOTWIN_EVAL_NUM_EPISODES:-100}}"
+if [[ ! "${eval_num_episodes}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "eval_num_episodes must be a positive integer: ${eval_num_episodes}" >&2
+    exit 1
+fi
+eval_output_overrides=()
+if [[ -n "${ROBOTWIN_EVAL_OUTPUT_ROOT:-}" ]]; then
+    eval_output_dir="${ROBOTWIN_EVAL_OUTPUT_ROOT}/${task_name}/${task_config}"
+    mkdir -p "${eval_output_dir}"
+    eval_output_overrides+=(--eval_output_dir "${eval_output_dir}")
+fi
 robotwin_python="${ROBOTWIN_PYTHON:-python}"
+export PATH="$(dirname "${robotwin_python}"):${PATH}"
 deploy_policy_template="${DEPLOY_POLICY_TEMPLATE_PATH:-${SCRIPT_DIR}/deploy_policy.yml}"
 
 if [[ ! -f "${deploy_policy_template}" ]]; then
@@ -94,4 +110,7 @@ PYTHONWARNINGS=ignore::UserWarning \
     --task_config "${task_config}" \
     --ckpt_setting "${ckpt_setting}" \
     --seed "${seed}" \
+    --instruction_type unseen \
+    --eval_num_episodes "${eval_num_episodes}" \
+    "${eval_output_overrides[@]}" \
     --policy_name "${policy_name}"
