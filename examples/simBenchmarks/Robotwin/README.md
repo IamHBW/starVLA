@@ -246,48 +246,8 @@ pip install -r examples/simBenchmarks/Robotwin/eval_files/requirements.txt
 export ROBOTWIN_PATH=/path/to/RoboTwin
 ```
 
-4. Because RoboTwin is a third-party repository, patch your own local RoboTwin checkout so `script/eval_policy.py` accepts `--policy_ckpt_path`.
-
-Apply the following change in your own RoboTwin repo:
-
-```diff
-diff --git a/script/eval_policy.py b/script/eval_policy.py
-index eded198..9fb36e3 100644
---- a/script/eval_policy.py
-+++ b/script/eval_policy.py
-@@ -69,6 +69,7 @@ def main(usr_args):
-     # checkpoint_num = usr_args['checkpoint_num']
-     policy_name = usr_args["policy_name"]
-     instruction_type = usr_args["instruction_type"]
-+    policy_ckpt_path = usr_args["policy_ckpt_path"]
-     save_dir = None
-     video_save_dir = None
-     video_size = None
-@@ -81,6 +82,7 @@ def main(usr_args):
-     args['task_name'] = task_name
-     args["task_config"] = task_config
-     args["ckpt_setting"] = ckpt_setting
-+    args["policy_ckpt_path"] = policy_ckpt_path
-
-     embodiment_type = args.get("embodiment")
-     embodiment_config_path = os.path.join(CONFIGS_PATH, "_embodiment_config.yml")
-@@ -327,11 +329,13 @@ def eval_policy(task_name,
- def parse_args_and_config():
-     parser = argparse.ArgumentParser()
-     parser.add_argument("--config", type=str, required=True)
-+    parser.add_argument("--policy_ckpt_path", type=str, required=True)
-     parser.add_argument("--overrides", nargs=argparse.REMAINDER)
-     args = parser.parse_args()
-
-     with open(args.config, "r", encoding="utf-8") as f:
-         config = yaml.safe_load(f)
-+    config["policy_ckpt_path"] = args.policy_ckpt_path
-
-     # Parse overrides
-     def parse_override_pairs(pairs):
-```
-
-This patch is intentionally documented here rather than vendored into `starVLA`, because RoboTwin is maintained in a separate repository. The StarVLA launcher passes `--policy_ckpt_path` at runtime; without this patch, RoboTwin cannot forward the checkpoint path into `model2robotwin_interface.py`.
+The launcher passes the checkpoint through RoboTwin's upstream `ckpt_setting`
+override, so the RoboTwin checkout does not need a local patch.
 
 Optional:
 
@@ -309,7 +269,7 @@ bash start_eval.sh -m <mode> -n <policy_name> -c <ckpt_path> [options] <tasks...
 | Flag | Description |
 |------|-------------|
 | `-m`, `--mode` | Eval mode: `demo_clean` or `demo_randomized` |
-| `-n`, `--name` | Policy name (used for log directory naming, forwarded to RoboTwin as `ckpt_setting`) |
+| `-n`, `--name` | Policy name used for log directory naming |
 | `-c`, `--ckpt` | Path to the StarVLA checkpoint file |
 
 #### Tasks (positional arguments)
@@ -464,13 +424,13 @@ bash examples/simBenchmarks/Robotwin/eval_files/run_policy_server.sh /path/to/ch
 ```bash
 conda activate robotwin
 cd examples/simBenchmarks/Robotwin/eval_files
-bash eval.sh <task_name> <task_config> <ckpt_setting> <seed> <gpu_id> <ckpt_path> [port] [host]
+bash eval.sh <task_name> <task_config> <ckpt_setting> <seed> <gpu_id> [port] [host]
 ```
 
 Example:
 
 ```bash
-bash eval.sh adjust_bottle demo_clean my_eval 0 0 /path/to/checkpoint.pt 5694
+bash eval.sh adjust_bottle demo_clean /path/to/checkpoint.pt 0 0 5694
 ```
 
 ### RoboTwin 2.0 task list

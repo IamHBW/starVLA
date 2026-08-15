@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -lt 6 ]]; then
-    echo "Usage: bash examples/simBenchmarks/Robotwin/eval_files/eval.sh <task_name> <task_config> <ckpt_setting> <seed> <gpu_id> <policy_ckpt_path> [policy_port] [policy_host] [eval_num_episodes]" >&2
+if [[ $# -lt 5 ]]; then
+    echo "Usage: bash examples/simBenchmarks/Robotwin/eval_files/eval.sh <task_name> <task_config> <ckpt_setting> <seed> <gpu_id> [policy_port] [policy_host] [eval_num_episodes]" >&2
     exit 1
 fi
 
@@ -25,35 +25,15 @@ if [[ ! -f "${robotwin_eval_script}" ]]; then
     exit 1
 fi
 
-patch_check_tool=""
-if command -v rg >/dev/null 2>&1; then
-    patch_check_tool="rg"
-    patch_check_cmd=(rg -q "policy_ckpt_path" "${robotwin_eval_script}")
-elif command -v grep >/dev/null 2>&1; then
-    patch_check_tool="grep"
-    patch_check_cmd=(grep -q "policy_ckpt_path" "${robotwin_eval_script}")
-else
-    echo "Neither rg nor grep is available, so the RoboTwin patch check cannot run." >&2
-    exit 1
-fi
-
-if ! "${patch_check_cmd[@]}"; then
-    echo "Your third-party RoboTwin checkout is missing the required policy_ckpt_path patch: ${robotwin_eval_script}" >&2
-    echo "Patch check used: ${patch_check_tool}" >&2
-    echo "Apply the documented patch in your own RoboTwin repo; see examples/simBenchmarks/Robotwin/README.md." >&2
-    exit 1
-fi
-
 policy_name="${ROBOTWIN_POLICY_NAME:-model2robotwin_interface}"
 task_name="$1"
 task_config="$2"
 ckpt_setting="${3:-starvla_demo}"
 seed="${4:-0}"
 gpu_id="${5:-0}"
-policy_ckpt_path="$6"
-policy_port="${7:-${ROBOTWIN_POLICY_PORT:-5694}}"
-policy_host="${8:-${ROBOTWIN_POLICY_HOST:-127.0.0.1}}"
-eval_num_episodes="${9:-${ROBOTWIN_EVAL_NUM_EPISODES:-100}}"
+policy_port="${6:-${ROBOTWIN_POLICY_PORT:-5694}}"
+policy_host="${7:-${ROBOTWIN_POLICY_HOST:-127.0.0.1}}"
+eval_num_episodes="${8:-${ROBOTWIN_EVAL_NUM_EPISODES:-100}}"
 if [[ ! "${eval_num_episodes}" =~ ^[1-9][0-9]*$ ]]; then
     echo "eval_num_episodes must be a positive integer: ${eval_num_episodes}" >&2
     exit 1
@@ -66,6 +46,7 @@ if [[ -n "${ROBOTWIN_EVAL_OUTPUT_ROOT:-}" ]]; then
 fi
 robotwin_python="${ROBOTWIN_PYTHON:-python}"
 export PATH="$(dirname "${robotwin_python}"):${PATH}"
+command -v ffmpeg >/dev/null || { echo "ffmpeg is required for RoboTwin video capture." >&2; exit 1; }
 deploy_policy_template="${DEPLOY_POLICY_TEMPLATE_PATH:-${SCRIPT_DIR}/deploy_policy.yml}"
 
 if [[ ! -f "${deploy_policy_template}" ]]; then
@@ -104,7 +85,6 @@ echo "policy_port: ${policy_port}"
 
 PYTHONWARNINGS=ignore::UserWarning \
 "${robotwin_python}" script/eval_policy.py --config "${runtime_deploy_policy}" \
-    --policy_ckpt_path "${policy_ckpt_path}" \
     --overrides \
     --task_name "${task_name}" \
     --task_config "${task_config}" \

@@ -1,4 +1,5 @@
 from collections import deque
+import json
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -76,7 +77,11 @@ class ModelClient:
                 "StarVLA server checkpoint mismatch: "
                 f"expected={policy_ckpt_path}, actual={server_checkpoint}"
             )
-        self.action_chunk_size = server_meta["action_chunk_size"]
+        self.action_chunk_size = int(server_meta["action_chunk_size"])
+        if self.action_chunk_size != 32:
+            raise RuntimeError(
+                f"RoboTwin requires action_chunk_size=32, got {self.action_chunk_size}"
+            )
         print(
             f"*** policy_setup: {policy_setup}, unnorm_key: {unnorm_key}, "
             f"action_mode: {action_mode}, normalization_mode: {normalization_mode}, "
@@ -90,6 +95,17 @@ class ModelClient:
             self.action_ensembler.reset()
         self.num_image_history = 0
         self.raw_actions = None
+        self._reported_action_contract = False
+        if task_description:
+            print(
+                "[ROBOTWIN_EPISODE] "
+                + json.dumps(
+                    {"instruction": task_description, "instruction_split": "unseen"},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
         # Reset state tracking for delta/rel modes
         self.initial_state = None
         self.prev_action = None
@@ -149,6 +165,17 @@ class ModelClient:
             response = self.client.predict_action(vla_input)
             # server already un-normalized via training-time transform
             raw_actions = np.array(response["data"]["actions"][0])  # (chunk, D)
+            if raw_actions.shape != (32, 14) or not np.isfinite(raw_actions).all():
+                raise RuntimeError(
+                    "Invalid RoboTwin action chunk: "
+                    f"shape={raw_actions.shape}, finite={np.isfinite(raw_actions).all()}"
+                )
+            if not self._reported_action_contract:
+                print(
+                    '[ROBOTWIN_ACTION] {"action_chunk_size": 32, "finite": true, "shape": [32, 14]}',
+                    flush=True,
+                )
+                self._reported_action_contract = True
 
             # Convert delta/rel to absolute actions
             if self.action_mode == "delta":
@@ -190,7 +217,7 @@ class ModelClient:
 
 
 def get_model(usr_args):
-    policy_ckpt_path = usr_args.get("policy_ckpt_path")
+    policy_ckpt_path = usr_args.get("policy_ckpt_path") or usr_args.get("ckpt_setting")
     host = usr_args.get("host", "127.0.0.1")
     port = usr_args.get("port", 5694)
     unnorm_key = usr_args.get("unnorm_key", None)
@@ -201,7 +228,7 @@ def get_model(usr_args):
     )
 
     if policy_ckpt_path is None:
-        raise ValueError("policy_ckpt_path must be provided in config")
+        raise ValueError("ckpt_setting must identify the policy checkpoint")
 
     return ModelClient(
         policy_ckpt_path=policy_ckpt_path,

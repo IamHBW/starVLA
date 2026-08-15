@@ -56,6 +56,11 @@ ROBOTWIN_ALL_TASKS=(
     turn_switch
 )
 
+if [[ "${1:-}" == "--list-tasks" ]]; then
+    printf '%s\n' "${ROBOTWIN_ALL_TASKS[@]}"
+    exit 0
+fi
+
 used_ports=()
 SLOT_GPUS=()
 SLOT_HOSTS=()
@@ -435,10 +440,9 @@ launch_task_in_slot() {
             bash "${SCRIPT_DIR}/eval.sh" \
                 "${task_name}" \
                 "${TASK_CONFIG}" \
-                "${POLICY_NAME}" \
+                "${CKPT_PATH}" \
                 "${ROBOTWIN_SEED:-0}" \
                 "${gpu_id}" \
-                "${CKPT_PATH}" \
                 "${port}" \
                 "${host}" \
                 "${ROBOTWIN_EVAL_NUM_EPISODES}" \
@@ -480,10 +484,9 @@ launch_task_in_slot() {
         bash "${SCRIPT_DIR}/eval.sh" \
             "${task_name}" \
             "${TASK_CONFIG}" \
-            "${POLICY_NAME}" \
+            "${CKPT_PATH}" \
             "${ROBOTWIN_SEED:-0}" \
             "${gpu_id}" \
-            "${CKPT_PATH}" \
             "${port}" \
             "127.0.0.1" \
             "${ROBOTWIN_EVAL_NUM_EPISODES}" \
