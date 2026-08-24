@@ -1,0 +1,280 @@
+import contextlib
+import importlib.util
+import json
+import os
+import shutil
+import subprocess
+from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+import torch
+from omegaconf import OmegaConf
+
+from starVLA.dataloader.gr00t_lerobot.registry import DATASET_NAMED_MIXTURES, ROBOT_TYPE_CONFIG_MAP
+from starVLA.model.framework.VLM4A.QwenPI import Qwen_PI
+from starVLA.model.framework.share_tools import apply_config_compat
+
+
+ROOT = Path(__file__).resolve().parents[1]
+TRAIN_FILES = ROOT / "examples/simBenchmarks/LIBERO/train_files"
+EVAL_FILE = ROOT / "examples/simBenchmarks/LIBERO/eval_files/qwen3_pi_4in1_30k_eval.py"
+SPEC = importlib.util.spec_from_file_location("qwen3_pi_4in1_30k_eval", EVAL_FILE)
+EVAL = importlib.util.module_from_spec(SPEC)
+assert SPEC.loader is not None
+SPEC.loader.exec_module(EVAL)
+
+
+def test_h32_registry_is_dedicated_and_equal_weighted():
+    assert ROBOT_TYPE_CONFIG_MAP["libero_franka"].action_indices == list(range(8))
+    assert ROBOT_TYPE_CONFIG_MAP["libero_franka_h32"].action_indices == list(range(32))
+    mixture = DATASET_NAMED_MIXTURES["libero_all_h32"]
+    assert len(mixture) == 4
+    assert all(weight == 1.0 and robot_type == "libero_franka_h32" for _, weight, robot_type in mixture)
+
+
+class _CaptureHead(torch.nn.Module):
+    def forward(self, vl_embeddings, actions, state, encoder_attention_mask=None):
+        self.batch_sizes = (actions.shape[0], *(hidden.shape[0] for hidden in vl_embeddings))
+        return actions.square().mean()
+
+
+def test_qwenpi_forward_honors_repeat_from_config():
+    model = object.__new__(Qwen_PI)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(
+        framework=SimpleNamespace(action_model={"repeated_diffusion_steps": 8})
+    )
+    model.action_horizon = 32
+    model.action_model = _CaptureHead()
+    model._encode_vl_hidden_states = lambda images, instructions: (
+        [torch.zeros(2, 3, 4), torch.zeros(2, 3, 4)],
+        torch.ones(2, 3, dtype=torch.bool),
+    )
+    examples = [
+        {"image": [], "lang": "task", "action": np.zeros((32, 7), dtype=np.float32)}
+        for _ in range(2)
+    ]
+    model.forward(examples)
+    assert model.action_model.batch_sizes == (16, 16, 16)
+
+
+def test_train_step_keeps_all_accumulated_microbatches(monkeypatch):
+    from starVLA.training.train_starvla import VLATrainer
+
+    class Accelerator:
+        sync_gradients = False
+        microbatch = 0
+
+        @contextlib.contextmanager
+        def accumulate(self, _model):
+            self.microbatch += 1
+            self.sync_gradients = self.microbatch % 4 == 0
+            yield
+
+        @staticmethod
+        def backward(loss):
+            loss.backward()
+
+    class Optimizer:
+        def __init__(self, parameter, accelerator):
+            self.base = torch.optim.SGD([parameter], lr=0.1)
+            self.accelerator = accelerator
+            self.synced_grad = None
+
+        def step(self):
+            if self.accelerator.sync_gradients:
+                self.synced_grad = model.weight.grad.detach().clone()
+                self.base.step()
+
+        def zero_grad(self):
+            if self.accelerator.sync_gradients:
+                self.base.zero_grad()
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor(1.0))
+
+        def forward(self, value):
+            return {"action_loss": self.weight * value}
+
+    class Scheduler:
+        steps = 0
+
+        def step(self):
+            self.steps += 1
+
+    monkeypatch.setattr(torch, "autocast", lambda *args, **kwargs: contextlib.nullcontext())
+    model = Model()
+    accelerator = Accelerator()
+    trainer = object.__new__(VLATrainer)
+    trainer.model = model
+    trainer.optimizer = Optimizer(model.weight, accelerator)
+    trainer.lr_scheduler = Scheduler()
+    trainer.accelerator = accelerator
+    trainer.config = SimpleNamespace(trainer=SimpleNamespace(strict_contract=False, gradient_clipping=None))
+    trainer._contract_checked = False
+
+    for value in (1.0, 2.0, 3.0, 4.0):
+        trainer._train_step(value)
+
+    assert trainer.optimizer.synced_grad.item() == pytest.approx(10.0)
+    assert model.weight.item() == pytest.approx(0.0, abs=1e-7)
+    assert trainer.lr_scheduler.steps == 1
+
+
+def test_train_config_and_launcher_contract(monkeypatch):
+    monkeypatch.setenv("QWEN3_VL_SNAPSHOT", "/tmp/qwen3")
+    monkeypatch.setenv("WANDB_ENTITY", "test-entity")
+    monkeypatch.setenv("WANDB_PROJECT", "test-project")
+    cfg = apply_config_compat(OmegaConf.load(TRAIN_FILES / "qwen3_pi_4in1_30k.yaml"), strict=True)
+    assert cfg.framework.name == "QwenPI"
+    assert cfg.framework.action_model.action_horizon == 32
+    assert cfg.framework.action_model.future_action_window_size == 31
+    assert cfg.framework.action_model.repeated_diffusion_steps == 8
+    assert cfg.framework.action_model.num_inference_timesteps == 4
+    assert cfg.framework.action_model.diffusion_model_cfg.use_canonical_forward is False
+    assert cfg.datasets.vla_data.data_mix == "libero_all_h32"
+    assert cfg.datasets.vla_data.include_state is False
+    assert cfg.datasets.vla_data.per_device_batch_size == 8
+    assert cfg.trainer.gradient_accumulation_steps == 4
+    assert cfg.datasets.vla_data.per_device_batch_size * 8 * cfg.trainer.gradient_accumulation_steps == 256
+    assert cfg.trainer.max_train_steps == 30000
+    assert cfg.trainer.freeze_modules == ""
+    assert "pretrained_checkpoint" not in cfg.trainer
+    launcher = TRAIN_FILES / "qwen3_pi_4in1_30k.sh"
+    source = launcher.read_text()
+    assert "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True" in source
+    assert source.count('bucket_size\"] = 100_000_000') == 2
+    assert 'git merge-base --is-ancestor "${starvla_base_revision}" HEAD' in source
+    subprocess.run(["bash", "-n", launcher], check=True, env=os.environ)
+
+
+def _make_gate_fixture(tmp_path):
+    run_dir = tmp_path / "run"
+    checkpoint = run_dir / "checkpoints/steps_30000_pytorch_model.pt"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_bytes(b"independent-30k-weights")
+    stats = run_dir / "dataset_statistics.json"
+    stats.write_text("{}\n")
+    cfg = {
+        "framework": {
+            "action_model": {
+                "action_dim": 7,
+                "action_horizon": 32,
+                "repeated_diffusion_steps": 8,
+                "num_inference_timesteps": 4,
+                "diffusion_model_cfg": {"use_canonical_forward": False},
+            }
+        },
+        "datasets": {
+            "vla_data": {
+                "data_mix": "libero_all_h32",
+                "per_device_batch_size": 8,
+                "include_state": False,
+            }
+        },
+        "trainer": {"max_train_steps": 30000, "gradient_accumulation_steps": 4},
+    }
+    OmegaConf.save(OmegaConf.create(cfg), run_dir / "resolved_input_config.yaml")
+    validation = {
+        "optimizer_step": 30000,
+        "actions_finite": True,
+        "normalized_action_shape": [1, 32, 7],
+        "unnormalized_action_shape": [32, 7],
+        "weights_sha256": {"checkpoints/steps_30000_pytorch_model.pt": EVAL.sha256(checkpoint)},
+        "dataset_statistics_sha256": EVAL.sha256(stats),
+    }
+    (run_dir / "checkpoint_validation.json").write_text(json.dumps(validation))
+    event = {
+        "git_sha": EVAL.STARVLA_REVISION,
+        "model": {"revision": EVAL.QWEN_REVISION},
+        "datasets": {name: {"revision": revision} for name, revision in EVAL.DATASET_REVISIONS.items()},
+    }
+    (run_dir / "run_manifest.json").write_text(json.dumps({"events": [event]}))
+    return run_dir, checkpoint
+
+
+def test_checkpoint_gate_rejects_100k_and_accepts_30k(tmp_path):
+    run_dir, checkpoint = _make_gate_fixture(tmp_path)
+    release = run_dir / "checkpoints/steps_100000_pytorch_model.pt"
+    release.write_bytes(b"release")
+    with pytest.raises(ValueError, match="only"):
+        EVAL.checkpoint_gate(run_dir, release, run_dir / "eval_gate.json")
+    gate = EVAL.checkpoint_gate(run_dir, checkpoint, run_dir / "eval_gate.json")
+    assert gate["complete"] is True
+    assert gate["optimizer_step"] == 30000
+    assert gate["checkpoint_sha256"] == EVAL.sha256(checkpoint)
+    assert gate["starvla_source_revision"] == EVAL.STARVLA_REVISION
+
+
+def test_eval_executes_24_of_each_32_action_chunk():
+    chunk = np.arange(32 * 7, dtype=np.float32).reshape(1, 32, 7)
+    executed = EVAL.StarAdapter.execution_prefix(chunk)
+    assert executed.shape == (24, 7)
+    np.testing.assert_array_equal(executed, chunk[0, :24])
+
+
+def _result_row(unit_id):
+    row = {
+        "dataset": "standard",
+        "mode": "suite-smoke",
+        "unit_id": unit_id,
+        "slot": unit_id,
+        "suite": "libero_spatial",
+        "task_index": unit_id,
+        "episode_index": 0,
+        "classification_id": "",
+        "task_name": f"task-{unit_id}",
+        "category": "",
+        "difficulty_level": "",
+        "checkpoint_sha256": "checkpoint",
+        "config_sha256": "config",
+        "normalization_sha256": "stats",
+        "gate_sha256": "gate",
+    }
+    return row
+
+
+def _result_record(row):
+    return {
+        **row,
+        "status": "completed",
+        "success": False,
+        "video_required": False,
+        "video_path": None,
+        "action_horizon": 32,
+        "replan_steps": 24,
+        "num_inference_steps": 4,
+        "finite_action_count": 1,
+    }
+
+
+def test_result_gate_rejects_deleted_and_duplicate_ids(tmp_path):
+    rows = [_result_row(0), _result_row(1)]
+    gate = {
+        "checkpoint_sha256": "checkpoint",
+        "config_sha256": "config",
+        "normalization_sha256": "stats",
+    }
+    paths = []
+    for row in rows:
+        path = EVAL.result_path(tmp_path, row)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(_result_record(row)))
+        paths.append(path)
+    records, errors = EVAL.validate_result_set(rows, tmp_path, gate)
+    assert len(records) == 2 and not any(errors.values())
+
+    paths[0].unlink()
+    _, errors = EVAL.validate_result_set(rows, tmp_path, gate)
+    assert errors["missing_unit_ids"] == [0]
+
+    paths[0].write_text(json.dumps(_result_record(rows[0])))
+    duplicate = tmp_path / "results/duplicate/result.json"
+    duplicate.parent.mkdir(parents=True)
+    shutil.copyfile(paths[0], duplicate)
+    _, errors = EVAL.validate_result_set(rows, tmp_path, gate)
+    assert errors["duplicate_unit_ids"] == [0]

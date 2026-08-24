@@ -64,6 +64,10 @@ class Libero4in1DataConfig:
         ])
 
 
+class Libero4in1H32DataConfig(Libero4in1DataConfig):
+    action_indices = list(range(32))
+
+
 class OpenPILibero4in1DataConfig(Libero4in1DataConfig):
     def transform(self):
         return ComposedModalityTransform(transforms=[
@@ -98,6 +102,7 @@ class OpenPILibero4in1DataConfig(Libero4in1DataConfig):
 
 ROBOT_TYPE_CONFIG_MAP = {
     "libero_franka": Libero4in1DataConfig(),
+    "libero_franka_h32": Libero4in1H32DataConfig(),
     "openpi_libero_franka": OpenPILibero4in1DataConfig(),
 }
 
@@ -121,6 +126,12 @@ DATASET_NAMED_MIXTURES = {
         ("libero_goal_no_noops_1.0.0_lerobot", 1.0, "libero_franka"),
         ("libero_spatial_no_noops_1.0.0_lerobot", 1.0, "libero_franka"),
         ("libero_10_no_noops_1.0.0_lerobot", 1.0, "libero_franka"),
+    ],
+    "libero_all_h32": [
+        ("libero_object_no_noops_1.0.0_lerobot", 1.0, "libero_franka_h32"),
+        ("libero_goal_no_noops_1.0.0_lerobot", 1.0, "libero_franka_h32"),
+        ("libero_spatial_no_noops_1.0.0_lerobot", 1.0, "libero_franka_h32"),
+        ("libero_10_no_noops_1.0.0_lerobot", 1.0, "libero_franka_h32"),
     ],
     "openpi_libero_all": [
         ("libero_object_no_noops_1.0.0_lerobot", 1.0, "openpi_libero_franka"),

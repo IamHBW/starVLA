@@ -545,8 +545,6 @@ class VLATrainer(TrainerUtils):
         """Execute single training step."""
         self._validate_contract(batch_vla)
         with self.accelerator.accumulate(self.model):
-            self.optimizer.zero_grad()
-
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 output_dict = self.model.forward(batch_vla)
                 action_loss = output_dict["action_loss"]
@@ -568,6 +566,7 @@ class VLATrainer(TrainerUtils):
             # at min_lr well before max_train_steps is reached.
             if self.accelerator.sync_gradients:
                 self.lr_scheduler.step()
+            self.optimizer.zero_grad()
 
         return {
             "action_dit_loss": action_loss.item(),

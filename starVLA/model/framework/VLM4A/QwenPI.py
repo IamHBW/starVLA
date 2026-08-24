@@ -221,7 +221,6 @@ class Qwen_PI(baseframework):
                 if self.config and hasattr(self.config, "framework")
                 else 4
             )
-            repeated_diffusion_steps = 2  # NO repeat for big action FM
             actions_target_repeated = actions_target.repeat(repeated_diffusion_steps, 1, 1)
             # Repeat features for each layer
             vl_embs_list_repeated = [h.repeat(repeated_diffusion_steps, 1, 1) for h in vl_embs_list]

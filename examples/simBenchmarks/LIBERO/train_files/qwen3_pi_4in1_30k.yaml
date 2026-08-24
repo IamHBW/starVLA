@@ -1,0 +1,88 @@
+run_id: qwen3_pi_libero4in1_30k
+run_root_dir: /mnt/data/users/bowen/workspace/ckpt
+seed: 42
+wandb_entity: ${oc.env:WANDB_ENTITY}
+wandb_project: ${oc.env:WANDB_PROJECT,StarVLA_LIBERO_Qwen3PI_30K}
+is_debug: false
+version_id: "0.21"
+
+framework:
+  name: QwenPI
+  qwenvl:
+    base_vlm: ${oc.env:QWEN3_VL_SNAPSHOT}
+    attn_implementation: sdpa
+    gradient_checkpointing: true
+  action_model:
+    action_model_type: DiT-B
+    action_hidden_dim: 1024
+    hidden_size: 1024
+    add_pos_embed: true
+    max_seq_len: 1024
+    action_dim: 7
+    state_dim: 7
+    action_horizon: 32
+    repeated_diffusion_steps: 8
+    num_inference_timesteps: 4
+    num_target_vision_tokens: 32
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+    num_timestep_buckets: 1000
+    diffusion_model_cfg:
+      dropout: 0.2
+      final_dropout: true
+      interleave_self_attention: true
+      use_canonical_forward: false
+      norm_type: ada_norm
+      output_dim: 1024
+      positional_embeddings: null
+  reduce_in_full_precision: true
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    data_root_dir: /mnt/data/users/bowen/workspace/data/starvla_libero_lerobot
+    data_mix: libero_all_h32
+    action_type: delta_qpos
+    include_state: false
+    strict_data_errors: true
+    balance_dataset_weights: false
+    balance_trajectory_weights: false
+    per_device_batch_size: 8
+    drop_last: true
+    num_workers: 4
+    persistent_workers: true
+    prefetch_factor: 2
+    pin_memory: true
+    obs_image_size: [224, 224]
+    video_backend: torchvision_av
+    lerobot_version: v2.0
+    CoT_prompt: "Your task is {instruction}. To identify the key objects for your task. Locate their bounding boxes in [x1,y1,x2,y2] format."
+
+trainer:
+  max_train_steps: 30000
+  num_warmup_steps: 5000
+  save_interval: 10000
+  eval_interval: 0
+  logging_frequency: 10
+  learning_rate:
+    base: 3.0e-05
+    qwen_vl_interface: 1.0e-05
+    action_model: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  freeze_modules: ""
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 4
+  strict_contract: false
+  wandb_required: true
+  full_state_checkpoints: true
+  validate_checkpoint: false
+  save_final_model: false
+  is_resume: false
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08
