@@ -18,6 +18,7 @@ import subprocess
 
 
 MODEL = "qwen3_vl_pi_c50_step30000"
+MODEL_LABEL = "Qwen3-VL-PI C50（step 30k）"
 PHASES = {"clean": ("demo_clean", "clean"), "randomized": ("demo_randomized", "random")}
 TASKS = (
     "adjust_bottle", "beat_block_hammer", "blocks_ranking_rgb", "blocks_ranking_size",
@@ -243,9 +244,13 @@ def _copy_representative_videos(rows: list[dict], report: Path) -> list[dict]:
 
 def _write_report(report: Path, summary: dict, selected: list[dict]) -> None:
     model_keys = list(summary["aggregate"])
+    denominator = summary["protocol"]["task_count"] * summary["protocol"]["episodes_per_task_phase"]
     overall = "\n".join(
-        f"<tr><td>{escape(model)}</td><td>{values['clean_successes']}/1000</td>"
-        f"<td>{values['randomized_successes']}/1000</td><td>{values['combined_successes']}/2000</td></tr>"
+        f"<tr><td>{escape(MODEL_LABEL if model == MODEL else model)}</td>"
+        f"<td>{values['clean_successes']}/{denominator}（{values['clean_rate']:.1%}）</td>"
+        f"<td>{values['randomized_successes']}/{denominator}（{values['randomized_rate']:.1%}）</td>"
+        f"<td>{values['combined_successes']}/{2 * denominator}（{values['combined_rate']:.1%}）</td>"
+        f"<td>{values['randomized_drop_pp']:+.1f} pp</td></tr>"
         for model, values in summary["aggregate"].items()
     )
     tasks = []
@@ -253,22 +258,40 @@ def _write_report(report: Path, summary: dict, selected: list[dict]) -> None:
         cells = []
         for model in model_keys:
             values = summary["per_task"][task][model]
-            cells.append(f"<td>{values['clean']}/20</td><td>{values['randomized']}/20</td>")
+            cells.append(
+                f"<td>{values['clean']}/20（{values['clean'] / 20:.1%}）</td>"
+                f"<td>{values['randomized']}/20（{values['randomized'] / 20:.1%}）</td>"
+            )
         tasks.append(f"<tr><td>{escape(task)}</td>{''.join(cells)}</tr>")
-    headers = "".join(f"<th colspan=\"2\">{escape(model)}</th>" for model in model_keys)
+    headers = "".join(
+        f"<th colspan=\"2\">{escape(MODEL_LABEL if model == MODEL else model)}</th>"
+        for model in model_keys
+    )
     subheaders = "".join("<th>Clean</th><th>Randomized</th>" for _ in model_keys)
     figures = "\n".join(
         f"<figure><video controls preload=\"metadata\" src=\"{escape(str(Path(item['path']).relative_to(report)))}\"></video>"
         f"<figcaption>{escape(item['phase'])} · {escape(item['task'])} · success={item['success']}</figcaption></figure>"
         for item in selected
     )
-    body = f"""<!doctype html><meta charset=\"utf-8\"><title>RoboTwin 六模型评测</title>
-<style>body{{font:14px system-ui;margin:24px}}table{{border-collapse:collapse}}th,td{{border:1px solid #aaa;padding:6px;text-align:right}}th:first-child,td:first-child{{text-align:left}}.scroll{{overflow:auto}}figure{{display:inline-block;width:360px;vertical-align:top}}video{{width:100%}}</style>
-<h1>RoboTwin unseen：六模型对比</h1><p>50 tasks × Clean/Randomized × 20 episodes；Qwen3-VL-PI 使用完整 32-step action chunk。</p>
-<h2>总体</h2><table><tr><th>模型</th><th>Clean</th><th>Randomized</th><th>Combined</th></tr>{overall}</table>
+    values = summary["aggregate"][MODEL]
+    task_values = {task: summary["per_task"][task][MODEL] for task in TASKS}
+    clean_ge_50 = sum(item["clean"] >= 10 for item in task_values.values())
+    randomized_ge_50 = sum(item["randomized"] >= 10 for item in task_values.values())
+    randomized_zero = sum(item["randomized"] == 0 for item in task_values.values())
+    randomized_top = sorted(TASKS, key=lambda task: task_values[task]["randomized"], reverse=True)[:5]
+    randomized_top_text = "、".join(
+        f"<code>{escape(task)}</code> {task_values[task]['randomized']}/20" for task in randomized_top
+    )
+    body = f"""<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Qwen3-VL-PI RoboTwin Unseen Eval</title>
+<style>:root{{color-scheme:light dark;font-family:system-ui,sans-serif}}body{{max-width:1280px;margin:auto;padding:32px 20px 56px;line-height:1.5}}table{{width:100%;border-collapse:collapse;white-space:nowrap}}th,td{{border:1px solid #8886;padding:8px 10px;text-align:right}}th:first-child,td:first-child{{text-align:left}}.scroll{{overflow:auto;margin:20px 0}}.lead,.warning{{padding:14px 16px;border-left:4px solid #4f8cff;background:#4f8cff12}}.warning{{border-color:#e8a43a;background:#e8a43a12}}.videos{{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px}}figure{{margin:0;padding:12px;border:1px solid #8885;border-radius:10px}}video{{width:100%;background:#000;border-radius:6px}}figcaption{{margin-top:8px}}</style></head><body>
+<h1>Qwen3-VL-PI RoboTwin Unseen Eval</h1><p>step 30k · global batch 256 · train instruction: seen · eval instruction: unseen · 50 tasks × 20 episodes/phase · Clean + Randomized · 2,000 episodes · action chunk 32</p>
+<p class=\"warning\"><strong>报告边界：</strong>这是当前 Qwen3-VL-PI checkpoint 的独立描述性报告，不与参考报告中的五个模型合并比较。参考报告仅用于版式，原文件未修改；完整 checkpoint、代码、RoboTwin vendor、环境、HTrain JOBID 与日志溯源见 <code>provenance.json</code>。</p>
+<h2>总体结果</h2><div class=\"scroll\"><table><tr><th>模型</th><th>Clean</th><th>Randomized</th><th>两阶段合计</th><th>Clean → Randomized</th></tr>{overall}</table></div>
+<p class=\"lead\"><strong>核心结果：</strong>Clean 为 {values['clean_successes']}/{denominator}（{values['clean_rate']:.1%}），Randomized 为 {values['randomized_successes']}/{denominator}（{values['randomized_rate']:.1%}），随机化环境下降 {abs(values['randomized_drop_pp']):.1f} 个百分点；两阶段合计 {values['combined_successes']}/{2 * denominator}（{values['combined_rate']:.1%}）。</p>
+<h2>任务分布</h2><p>Clean 有 {clean_ge_50}/50 个任务达到至少 50% 成功率；Randomized 仅 {randomized_ge_50}/50 个达到至少 50%，且 {randomized_zero}/50 个任务为 0/20。Randomized 表现最好的五项是：{randomized_top_text}。</p>
 <h2>逐任务</h2><div class=\"scroll\"><table><tr><th rowspan=\"2\">Task</th>{headers}</tr><tr>{subheaders}</tr>{''.join(tasks)}</table></div>
-<h2>Qwen3-VL-PI 代表视频</h2>{figures}
-<p>来源、hash、HTrain JOBID 与原始日志见 <code>provenance.json</code>。</p>"""
+<h2>代表视频</h2><div class=\"videos\">{figures}</div>
+<p>逐 episode 证据见 <code>../results_detailed.jsonl</code>；机器可读汇总见 <code>summary.json</code> 和 <code>summary.csv</code>。</p></body></html>"""
     (report / "index.html").write_text(body, encoding="utf-8")
     (report / "index_rgb.html").write_text(body.replace("<h1>", "<p>RGB 输入：head → left → right，224×224。</p><h1>"), encoding="utf-8")
 
@@ -290,28 +313,23 @@ def collect(args) -> None:
         })
 
     reference = Path(args.reference).resolve()
-    combined = _check_reference(reference)
-    combined["aggregate"].update(own["aggregate"])
-    for task in TASKS:
-        combined["per_task"][task].update(own["per_task"][task])
-    combined["protocol"].update(own["protocol"])
+    _check_reference(reference)
     report = root / "report"
     report.mkdir(parents=True, exist_ok=True)
     selected = _copy_representative_videos(rows, report)
-    _write_json(report / "summary.json", combined)
+    _write_json(report / "summary.json", own)
     with (report / "summary.csv").open("w", newline="", encoding="utf-8") as stream:
-        fields = ["task"] + [f"{model}_{phase}_successes" for model in combined["aggregate"] for phase in PHASES]
+        fields = ["task"] + [f"{MODEL}_{phase}_successes" for phase in PHASES]
         writer = csv.DictWriter(stream, fieldnames=fields)
         writer.writeheader()
         for task in TASKS:
             row = {"task": task}
-            for model in combined["aggregate"]:
-                for phase in PHASES:
-                    row[f"{model}_{phase}_successes"] = combined["per_task"][task][model][phase]
+            for phase in PHASES:
+                row[f"{MODEL}_{phase}_successes"] = own["per_task"][task][MODEL][phase]
             writer.writerow(row)
     provenance = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "reference": {"path": str(reference), "hashes": REFERENCE_HASHES, "modified": False},
+        "template_reference": {"path": str(reference), "hashes": REFERENCE_HASHES, "modified": False},
         "qwen3_vl_pi": {
             "phase_provenance": {phase: _json(root / f"provenance_{phase}.json") for phase in PHASES},
             "jobs": _json(root / "jobs.json") if (root / "jobs.json").is_file() else [],
@@ -320,7 +338,7 @@ def collect(args) -> None:
         },
     }
     _write_json(report / "provenance.json", provenance)
-    _write_report(report, combined, selected)
+    _write_report(report, own, selected)
     print(json.dumps(own["aggregate"][MODEL], indent=2))
 
 

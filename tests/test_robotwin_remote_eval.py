@@ -233,6 +233,15 @@ class RoboTwinRemoteEvalTest(unittest.TestCase):
             self.assertNotIn(task, output)
             self.assertEqual(len(output), 49)
 
+    def test_report_is_current_model_only(self):
+        summary = aggregate_eval._aggregate([], 20)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            report = Path(temporary_directory)
+            aggregate_eval._write_report(report, summary, [])
+            html = (report / "index.html").read_text(encoding="utf-8")
+        self.assertIn("Qwen3-VL-PI RoboTwin Unseen Eval", html)
+        self.assertNotIn("六模型", html)
+
 
 if __name__ == "__main__":
     unittest.main()
