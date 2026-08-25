@@ -149,10 +149,20 @@ def test_train_config_and_launcher_contract(monkeypatch):
     assert "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True" in source
     assert source.count('bucket_size\"] = 100_000_000') == 2
     assert 'git merge-base --is-ancestor "${starvla_base_revision}" HEAD' in source
+    assert '--deepspeed_multinode_launcher standard' in source
+    assert '--num_machines "${num_nodes}"' in source
+    assert '--num_processes "${total_processes}"' in source
+    assert '--machine_rank "${node_rank}"' in source
+    assert '--trainer.gradient_accumulation_steps "${gradient_accumulation}"' in source
     subprocess.run(["bash", "-n", launcher], check=True, env=os.environ)
+    subprocess.run(
+        ["bash", "-n", ROOT / "examples/simBenchmarks/LIBERO/eval_files/qwen3_pi_4in1_30k_eval.sh"],
+        check=True,
+        env=os.environ,
+    )
 
 
-def _make_gate_fixture(tmp_path):
+def _make_gate_fixture(tmp_path, *, world_size=8, gradient_accumulation=4):
     run_dir = tmp_path / "run"
     checkpoint = run_dir / "checkpoints/steps_30000_pytorch_model.pt"
     checkpoint.parent.mkdir(parents=True)
@@ -176,7 +186,7 @@ def _make_gate_fixture(tmp_path):
                 "include_state": False,
             }
         },
-        "trainer": {"max_train_steps": 30000, "gradient_accumulation_steps": 4},
+        "trainer": {"max_train_steps": 30000, "gradient_accumulation_steps": gradient_accumulation},
     }
     OmegaConf.save(OmegaConf.create(cfg), run_dir / "resolved_input_config.yaml")
     validation = {
@@ -192,6 +202,12 @@ def _make_gate_fixture(tmp_path):
         "git_sha": EVAL.STARVLA_REVISION,
         "model": {"revision": EVAL.QWEN_REVISION},
         "datasets": {name: {"revision": revision} for name, revision in EVAL.DATASET_REVISIONS.items()},
+        "batch": {
+            "per_device": 8,
+            "world_size": world_size,
+            "gradient_accumulation": gradient_accumulation,
+            "global": 256,
+        },
     }
     (run_dir / "run_manifest.json").write_text(json.dumps({"events": [event]}))
     return run_dir, checkpoint
@@ -208,6 +224,17 @@ def test_checkpoint_gate_rejects_100k_and_accepts_30k(tmp_path):
     assert gate["optimizer_step"] == 30000
     assert gate["checkpoint_sha256"] == EVAL.sha256(checkpoint)
     assert gate["starvla_source_revision"] == EVAL.STARVLA_REVISION
+
+
+def test_checkpoint_gate_accepts_equivalent_two_node_batch(tmp_path):
+    run_dir, checkpoint = _make_gate_fixture(tmp_path, world_size=16, gradient_accumulation=2)
+    gate = EVAL.checkpoint_gate(run_dir, checkpoint, run_dir / "eval_gate.json")
+    assert gate["training_batch"] == {
+        "per_device": 8,
+        "world_size": 16,
+        "gradient_accumulation": 2,
+        "global": 256,
+    }
 
 
 def test_eval_executes_24_of_each_32_action_chunk():

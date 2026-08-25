@@ -7,27 +7,68 @@ python_bin=/mnt/data/users/bowen/workspace/envs/starvla/bin/python
 accelerate_bin=/mnt/data/users/bowen/workspace/envs/starvla/bin/accelerate
 tokens=/mnt/data/users/bowen/workspace/tokens.sh
 data_root=/mnt/data/users/bowen/workspace/data/starvla_libero_lerobot
-run_dir=/mnt/data/users/bowen/workspace/ckpt/qwen3_pi_libero4in1_30k
+run_dir="${RUN_DIR:-/mnt/data/users/bowen/workspace/ckpt/qwen3_pi_libero4in1_30k}"
 config="${script_dir}/qwen3_pi_4in1_30k.yaml"
 model_revision=ebb281ec70b05090aa6165b016eac8ec08e71b17
 starvla_base_revision=02861ead680ea648c367ed41cf0d0976581f0467
 model_snapshot="/mnt/data/users/bowen/workspace/outputs/model_cache/huggingface/hub/models--Qwen--Qwen3-VL-4B-Instruct/snapshots/${model_revision}"
+num_nodes="${NNODES:-${NUM_NODES:-1}}"
+gpus_per_node="${NUM_GPUS_PER_NODE:-${GPUS_PER_NODE:-8}}"
+gradient_accumulation="${GRADIENT_ACCUMULATION_STEPS:-4}"
+for value in "${num_nodes}" "${gpus_per_node}" "${gradient_accumulation}"; do
+  [[ "${value}" =~ ^[0-9]+$ ]] || { echo "Invalid distributed integer: ${value}" >&2; exit 2; }
+done
+host="${HOSTNAME:-$(hostname -s)}"
+node_rank="${PET_NODE_RANK:-${NODE_RANK:-}}"
+if [[ -z "${node_rank}" ]]; then
+  if [[ "${host}" =~ -master-([0-9]+)$ ]]; then
+    node_rank="${BASH_REMATCH[1]}"
+  elif [[ "${host}" =~ -worker-([0-9]+)$ ]]; then
+    node_rank="$((BASH_REMATCH[1] + 1))"
+  else
+    node_rank=0
+  fi
+fi
+master_addr="${PET_MASTER_ADDR:-${MASTER_ADDR:-}}"
+if [[ -z "${master_addr}" ]]; then
+  if ((num_nodes == 1)); then
+    master_addr=127.0.0.1
+  elif [[ "${host}" =~ -worker-[0-9]+$ ]]; then
+    master_addr="${host%-worker-*}-master-0"
+  elif [[ "${host}" =~ -master-[0-9]+$ ]]; then
+    master_addr="${host%-master-*}-master-0"
+  else
+    echo "Cannot infer multi-node master address from host ${host}" >&2
+    exit 2
+  fi
+fi
+master_port="${PET_MASTER_PORT:-${MASTER_PORT:-29500}}"
+total_processes=$((num_nodes * gpus_per_node))
+train_run_id="$(basename "${run_dir}")"
+run_root_dir="$(dirname "${run_dir}")"
 
 cd "${repo}"
 git merge-base --is-ancestor "${starvla_base_revision}" HEAD || { echo "Unexpected StarVLA base revision" >&2; exit 2; }
 [[ -x "${python_bin}" && -x "${accelerate_bin}" ]] || { echo "Missing StarVLA environment" >&2; exit 2; }
 [[ -f "${tokens}" && "$(stat -c %U "${tokens}")" == bowen ]] || { echo "Refusing credentials not owned by bowen" >&2; exit 2; }
 [[ -d "${data_root}" && -d "${model_snapshot}" && -f "${config}" ]] || { echo "Missing frozen input" >&2; exit 2; }
-[[ $((8 * 8 * 4)) == 256 ]] || { echo "Invalid global batch formula" >&2; exit 2; }
+for value in "${node_rank}" "${master_port}"; do
+  [[ "${value}" =~ ^[0-9]+$ ]] || { echo "Invalid distributed integer: ${value}" >&2; exit 2; }
+done
+((num_nodes >= 1 && gpus_per_node == 8 && node_rank < num_nodes)) || { echo "Invalid topology ${node_rank}/${num_nodes}x${gpus_per_node}" >&2; exit 2; }
+[[ "${run_dir}" == /mnt/data/users/bowen/workspace/ckpt/* && "${train_run_id}" != */* ]] || { echo "Invalid run destination: ${run_dir}" >&2; exit 2; }
+global_batch=$((8 * total_processes * gradient_accumulation))
+((global_batch == 256)) || { echo "Invalid global batch: 8 x ${total_processes} x ${gradient_accumulation} = ${global_batch}" >&2; exit 2; }
+echo "[qwen3-pi] host=${host} node_rank=${node_rank}/${num_nodes} master=${master_addr}:${master_port} world_size=${total_processes} per_device=8 accumulation=${gradient_accumulation} global_batch=${global_batch} run_dir=${run_dir}"
 
 resume=false
 if [[ "${RESUME:-0}" == 1 ]]; then
   resume=true
   compgen -G "${run_dir}/checkpoints/full_state_step_*" >/dev/null || { echo "No full state to resume" >&2; exit 2; }
-elif [[ -e "${run_dir}" && ! -d "${run_dir}" ]]; then
+elif ((node_rank == 0)) && [[ -e "${run_dir}" && ! -d "${run_dir}" ]]; then
   echo "Run path exists and is not a directory: ${run_dir}" >&2
   exit 2
-elif [[ -d "${run_dir}" ]] && find "${run_dir}" -mindepth 1 \
+elif ((node_rank == 0)) && [[ -d "${run_dir}" ]] && find "${run_dir}" -mindepth 1 \
   ! -name 'htrain*.log' \
   ! -path "${run_dir}/failed_attempts" \
   ! -path "${run_dir}/failed_attempts/*" \
@@ -41,7 +82,7 @@ source "${tokens}"
 export WANDB_MODE=online
 export WANDB_PROJECT=StarVLA_LIBERO_Qwen3PI_30K
 : "${WANDB_ENTITY:?WANDB_ENTITY must come from current-user tokens.sh}"
-export WANDB_RUN_ID=qwen3-pi-libero4in1-30k
+export WANDB_RUN_ID="${WANDB_RUN_ID:-${train_run_id}}"
 export WANDB_RESUME=allow
 export QWEN3_VL_SNAPSHOT="${model_snapshot}"
 export STARVLA_BASE_REVISION="${starvla_base_revision}"
@@ -52,7 +93,9 @@ export TORCH_NCCL_BLOCKING_WAIT=1
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 export NCCL_TIMEOUT=1000
 
-mkdir -p "${run_dir}/wandb" "${run_dir}/cache/huggingface" "${run_dir}/cache/torch" "${run_dir}/cache/triton"
+if ((node_rank == 0)); then
+  mkdir -p "${run_dir}/wandb" "${run_dir}/cache/huggingface" "${run_dir}/cache/torch" "${run_dir}/cache/triton"
+fi
 export WANDB_DIR="${run_dir}/wandb"
 export WANDB_CACHE_DIR="${run_dir}/cache/wandb"
 export WANDB_DATA_DIR="${run_dir}/cache/wandb"
@@ -61,7 +104,11 @@ export TORCH_HOME="${run_dir}/cache/torch"
 export TRITON_CACHE_DIR="${run_dir}/cache/triton"
 export XDG_CACHE_HOME="${run_dir}/cache"
 
-"${python_bin}" - "${repo}" "${run_dir}" "${data_root}" "${model_snapshot}" "${config}" "${resume}" <<'PY'
+preflight_done="${run_dir}/.preflight_done"
+preflight_failed="${run_dir}/.preflight_failed"
+if ((node_rank == 0)); then
+  if ! "${python_bin}" - "${repo}" "${run_dir}" "${data_root}" "${model_snapshot}" "${config}" "${resume}" \
+    "${total_processes}" "${gradient_accumulation}" "${num_nodes}" "${gpus_per_node}" "${train_run_id}" "${run_root_dir}" <<'PY'
 import grp
 import hashlib
 import importlib.metadata
@@ -77,6 +124,8 @@ from omegaconf import OmegaConf
 
 repo, run_dir, data_root, model, config = map(Path, sys.argv[1:6])
 resume = sys.argv[6] == "true"
+world_size, gradient_accumulation, num_nodes, gpus_per_node = map(int, sys.argv[7:11])
+train_run_id, run_root_dir = sys.argv[11:13]
 expected = {
     "libero_spatial_no_noops_1.0.0_lerobot": ("bf14d6258218d12c2e3c1a3b9922e163cdf6455d", 432, 52970),
     "libero_object_no_noops_1.0.0_lerobot": ("15657dac2ad1c01b4e94bf54ab0493b46a8d63f9", 454, 66984),
@@ -140,6 +189,8 @@ if sum(v["data_video_bytes"] for v in datasets.values()) != 1881101992:
 
 cfg = OmegaConf.load(config)
 resolved_cfg = OmegaConf.to_container(cfg, resolve=True)
+resolved_cfg["run_id"] = train_run_id
+resolved_cfg["run_root_dir"] = run_root_dir
 am = resolved_cfg["framework"]["action_model"]
 vla = resolved_cfg["datasets"]["vla_data"]
 trainer = resolved_cfg["trainer"]
@@ -147,19 +198,22 @@ assert (am["action_horizon"], am["repeated_diffusion_steps"], am["num_inference_
 assert am["diffusion_model_cfg"]["use_canonical_forward"] is False
 assert (vla["data_mix"], vla["per_device_batch_size"], vla["include_state"]) == ("libero_all_h32", 8, False)
 assert (trainer["max_train_steps"], trainer["gradient_accumulation_steps"], trainer["is_resume"]) == (30000, 4, False)
+trainer["gradient_accumulation_steps"] = gradient_accumulation
 assert not trainer.get("pretrained_checkpoint") and trainer["freeze_modules"] == ""
+assert 8 * world_size * gradient_accumulation == 256
 OmegaConf.save(OmegaConf.create(resolved_cfg), run_dir / "resolved_input_config.yaml")
 
 ds = json.loads((repo / "starVLA/config/deepseeds/ds_config.yaml").read_text())
 ds["train_micro_batch_size_per_gpu"] = 8
-ds["gradient_accumulation_steps"] = 4
+ds["gradient_accumulation_steps"] = gradient_accumulation
 ds["train_batch_size"] = 256
 ds["zero_optimization"]["allgather_bucket_size"] = 100_000_000
 ds["zero_optimization"]["reduce_bucket_size"] = 100_000_000
 ds_path = run_dir / "resolved_deepspeed_config.json"
 ds_path.write_text(json.dumps(ds, indent=2) + "\n")
 accelerate = OmegaConf.load(repo / "starVLA/config/deepseeds/deepspeed_zero2.yaml")
-accelerate.num_processes = 8
+accelerate.num_machines = num_nodes
+accelerate.num_processes = world_size
 accelerate.deepspeed_config.deepspeed_config_file = str(ds_path)
 OmegaConf.save(accelerate, run_dir / "accelerate_config.yaml")
 
@@ -187,7 +241,8 @@ event = {
     "packages": packages,
     "gpu": run("nvidia-smi", "--query-gpu=name,memory.total,driver_version", "--format=csv,noheader"),
     "disk": run("df", "-h", "/mnt/data"),
-    "batch": {"per_device": 8, "world_size": 8, "gradient_accumulation": 4, "global": 256},
+    "batch": {"per_device": 8, "world_size": world_size, "gradient_accumulation": gradient_accumulation, "global": 256},
+    "topology": {"nodes": num_nodes, "gpus_per_node": gpus_per_node},
     "memory_strategy": {
         "pytorch_cuda_alloc_conf": os.environ["PYTORCH_CUDA_ALLOC_CONF"],
         "zero_stage": ds["zero_optimization"]["stage"],
@@ -203,23 +258,48 @@ manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else 
 manifest["events"].append(event)
 manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
 PY
-
-cp -f "${config}" "${run_dir}/source_config.yaml"
-cp -f "${BASH_SOURCE[0]}" "${run_dir}/source_launcher.sh"
-cp -f "${repo}/docs/spec_qwen3_vl_pi_libero_4in1_30k.md" "${run_dir}/task_spec.md"
+  then
+    touch "${preflight_failed}"
+    exit 1
+  fi
+  cp -f "${config}" "${run_dir}/source_config.yaml"
+  cp -f "${BASH_SOURCE[0]}" "${run_dir}/source_launcher.sh"
+  cp -f "${repo}/docs/spec_qwen3_vl_pi_libero_4in1_30k.md" "${run_dir}/task_spec.md"
+  touch "${preflight_done}"
+else
+  for _ in {1..3600}; do
+    [[ -e "${preflight_failed}" ]] && { echo "Rank-0 preflight failed" >&2; exit 1; }
+    [[ -e "${preflight_done}" ]] && break
+    sleep 1
+  done
+  [[ -e "${preflight_done}" ]] || { echo "Timed out waiting for rank-0 preflight" >&2; exit 1; }
+fi
 
 train_command=(
   "${accelerate_bin}" launch
   --config_file "${run_dir}/accelerate_config.yaml"
-  --num_processes 8
-  --gradient_accumulation_steps 4
+  --deepspeed_multinode_launcher standard
+  --num_machines "${num_nodes}"
+  --num_processes "${total_processes}"
+  --machine_rank "${node_rank}"
+  --main_process_ip "${master_addr}"
+  --main_process_port "${master_port}"
+  --same_network
+  --gradient_accumulation_steps "${gradient_accumulation}"
   "${repo}/starVLA/training/train_starvla.py"
   --config_yaml "${config}"
+  --run_root_dir "${run_root_dir}"
+  --run_id "${train_run_id}"
+  --trainer.gradient_accumulation_steps "${gradient_accumulation}"
   --trainer.is_resume "${resume}"
 )
-printf '%q ' "${train_command[@]}" >"${run_dir}/training_command.txt"
-printf '\n' >>"${run_dir}/training_command.txt"
+if ((node_rank == 0)); then
+  printf '%q ' "${train_command[@]}" >"${run_dir}/training_command.txt"
+  printf '\n' >>"${run_dir}/training_command.txt"
+fi
 "${train_command[@]}"
+
+((node_rank == 0)) || exit 0
 
 "${python_bin}" - "${run_dir}" "${data_root}" <<'PY'
 import hashlib
@@ -292,5 +372,5 @@ result = {
 PY
 
 if [[ "${RUN_EVAL_AFTER_TRAIN:-1}" == 1 ]]; then
-  "${repo}/examples/simBenchmarks/LIBERO/eval_files/qwen3_pi_4in1_30k_eval.sh"
+  RUN_DIR="${run_dir}" "${repo}/examples/simBenchmarks/LIBERO/eval_files/qwen3_pi_4in1_30k_eval.sh"
 fi

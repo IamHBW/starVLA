@@ -4,7 +4,7 @@ set -euo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "${script_dir}/../../../.." && pwd)"
 runner="${script_dir}/qwen3_pi_4in1_30k_eval.py"
-run_dir=/mnt/data/users/bowen/workspace/ckpt/qwen3_pi_libero4in1_30k
+run_dir="${RUN_DIR:-/mnt/data/users/bowen/workspace/ckpt/qwen3_pi_libero4in1_30k}"
 checkpoint="${run_dir}/checkpoints/steps_30000_pytorch_model.pt"
 model_snapshot=/mnt/data/users/bowen/workspace/outputs/model_cache/huggingface/hub/models--Qwen--Qwen3-VL-4B-Instruct/snapshots/ebb281ec70b05090aa6165b016eac8ec08e71b17
 train_python=/mnt/data/users/bowen/workspace/envs/starvla/bin/python

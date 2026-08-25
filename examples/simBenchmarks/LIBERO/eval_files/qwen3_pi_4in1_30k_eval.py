@@ -120,6 +120,11 @@ def checkpoint_gate(run_dir: str | Path, checkpoint: str | Path, output: str | P
     validation = json.loads(validation_path.read_text(encoding="utf-8"))
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     cfg = OmegaConf.to_container(OmegaConf.load(config_path), resolve=True)
+    events = manifest.get("events", [])
+    if not events:
+        raise ValueError("run manifest has no provenance event")
+    event = events[-1]
+    batch = event.get("batch", {})
 
     action = cfg["framework"]["action_model"]
     diffusion = action["diffusion_model_cfg"]
@@ -135,7 +140,11 @@ def checkpoint_gate(run_dir: str | Path, checkpoint: str | Path, output: str | P
         and vla["per_device_batch_size"] == 8
         and vla["include_state"] is False
         and trainer["max_train_steps"] == 30000
-        and trainer["gradient_accumulation_steps"] == 4
+        and batch.get("per_device") == vla["per_device_batch_size"]
+        and batch.get("gradient_accumulation") == trainer["gradient_accumulation_steps"]
+        and batch.get("world_size", 0) > 0
+        and batch["per_device"] * batch["world_size"] * batch["gradient_accumulation"] == 256
+        and batch.get("global") == 256
     )
     if not contract:
         raise ValueError("resolved training config violates the frozen eval contract")
@@ -154,10 +163,6 @@ def checkpoint_gate(run_dir: str | Path, checkpoint: str | Path, output: str | P
     if validation.get("dataset_statistics_sha256") != stats_hash:
         raise ValueError("normalization statistics hash mismatch")
 
-    events = manifest.get("events", [])
-    if not events:
-        raise ValueError("run manifest has no provenance event")
-    event = events[-1]
     revisions = {name: item.get("revision") for name, item in event.get("datasets", {}).items()}
     if event.get("starvla_base_sha", event.get("git_sha")) != STARVLA_REVISION:
         raise ValueError("StarVLA base revision mismatch")
@@ -188,6 +193,7 @@ def checkpoint_gate(run_dir: str | Path, checkpoint: str | Path, output: str | P
         "image_size": [224, 224],
         "image_order": ["primary", "wrist"],
         "include_state": False,
+        "training_batch": batch,
     }
     atomic_json(gate, output)
     print(json.dumps(gate, indent=2, sort_keys=True))
