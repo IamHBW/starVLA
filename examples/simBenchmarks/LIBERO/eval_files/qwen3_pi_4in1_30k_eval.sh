@@ -3,6 +3,7 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "${script_dir}/../../../.." && pwd)"
+export PYTHONPATH="${repo}${PYTHONPATH:+:${PYTHONPATH}}"
 runner="${script_dir}/qwen3_pi_4in1_30k_eval.py"
 run_dir="${RUN_DIR:-/mnt/data/users/bowen/workspace/ckpt/qwen3_pi_libero4in1_30k}"
 checkpoint="${run_dir}/checkpoints/steps_30000_pytorch_model.pt"
@@ -13,6 +14,7 @@ plus_python=/mnt/data/users/bowen/workspace/envs/openvla-oft-plus/bin/python
 standard_repo=/mnt/data/users/bowen/workspace/code/LIBERO
 plus_repo=/mnt/data/users/bowen/workspace/code/LIBERO-plus
 plus_deps=/mnt/data/users/bowen/workspace/code/lingbot-va/outputs/libero_plus/20260731T075749Z_libero_long/client_deps
+data_root=/mnt/data/users/bowen/workspace/data/starvla_libero_lerobot
 standard_revision=8f1084e3132a39270c3a13ebe37270a43ece2a01
 plus_revision=4c83d77c807983abf01da2c23bc8d2f72a204912
 starvla_base_revision=02861ead680ea648c367ed41cf0d0976581f0467
@@ -59,6 +61,9 @@ mkdir -p "${eval_root}/logs" "${runtime_dir}/standard_config" "${runtime_dir}/pl
 standard_config="${runtime_dir}/standard_config"
 plus_config="${runtime_dir}/plus_config"
 
+# HTrain exports distributed variables even though this launcher is single-process.
+unset WORLD_SIZE RANK LOCAL_RANK LOCAL_WORLD_SIZE MASTER_ADDR MASTER_PORT GROUP_RANK ROLE_RANK ROLE_WORLD_SIZE
+
 "${train_python}" - "${standard_config}/config.yaml" "${standard_repo}" <<'PY'
 import sys
 from pathlib import Path
@@ -87,6 +92,12 @@ values = {
 }
 output.write_text("".join(f"{key}: {value}\n" for key, value in values.items()), encoding="utf-8")
 PY
+
+if [[ ! -f "${run_dir}/checkpoint_validation.json" ]]; then
+  QWEN3_VL_SNAPSHOT="${model_snapshot}" "${train_python}" "${runner}" validate-checkpoint \
+    --run-dir "${run_dir}" --data-root "${data_root}" \
+    >"${run_dir}/eval/checkpoint_validation.log" 2>&1
+fi
 
 set +e
 "${train_python}" "${runner}" checkpoint-gate \
@@ -228,6 +239,7 @@ launch_server() {
       PYTHONPATH="${repo}" \
       "${train_python}" deployment/model_server/server_policy.py \
       --ckpt_path "${checkpoint}" --port "${port}" --use_bf16 --idle_timeout -1 \
+      --config_override datasets.vla_data.obs_image_size=[224,224] \
       --config_override framework.action_model.diffusion_model_cfg.use_canonical_forward=false \
       --config_override "framework.qwenvl.base_vlm=${model_snapshot}"
   ) >"${log}" 2>&1 &
@@ -412,7 +424,7 @@ summary = {"complete": True, "standard": standard, "plus": plus}
 report = (
     "# Qwen3-VL QwenPI LIBERO 4-in-1 30K\n\n"
     f"- Checkpoint: 30,000 optimizer steps\n"
-    f"- Horizon/replan: 32/24\n"
+    f"- Horizon/replan: {standard['protocol']['action_horizon']}/{standard['protocol']['replan_steps']}\n"
     f"- Standard: {standard['overall']['successes']}/2000 ({standard['overall']['success_rate']:.2%})\n"
     f"- LIBERO-Plus: {plus['overall']['successes']}/10030 ({plus['overall']['success_rate']:.2%})\n"
     "- Full per-suite, per-task, per-category metrics and retry evidence are in the adjacent summaries.\n"

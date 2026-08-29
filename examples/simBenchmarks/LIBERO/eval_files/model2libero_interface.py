@@ -112,23 +112,23 @@ class ModelClient:
         if task_description != self.task_description:
             self.reset(task_description)
 
-        # Resize images to self.image_size if needed.
-        if self.image_size and example.get("image"):
-            resized = []
-            target_hw = self.image_size  # (H, W)
-            for img in example["image"]:
-                arr = np.asarray(img)
-                if arr.shape[:2] != target_hw:
-                    arr = np.asarray(
-                        Image.fromarray(arr).resize(
-                            (target_hw[1], target_hw[0]), Image.BILINEAR
-                        )
-                    )
-                resized.append(arr)
-            example = {**example, "image": resized}
-
         # Refresh chunk if needed.
         if step % self.action_chunk_size == 0 or self.raw_actions is None:
+            # Cached actions need no observation preprocessing or RPC.
+            if self.image_size and example.get("image"):
+                resized = []
+                target_hw = self.image_size  # (H, W)
+                for img in example["image"]:
+                    arr = np.asarray(img)
+                    if arr.shape[:2] != target_hw:
+                        arr = np.asarray(
+                            Image.fromarray(arr).resize(
+                                (target_hw[1], target_hw[0]), Image.BILINEAR
+                            )
+                        )
+                    resized.append(arr)
+                example = {**example, "image": resized}
+
             vla_input = {
                 "examples": [example],
                 "unnorm_key": self.unnorm_key,

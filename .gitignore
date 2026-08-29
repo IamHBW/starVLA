@@ -247,6 +247,8 @@ wandb/*
 !docs/model_zoo.md
 !docs/starVLA_guideline.md
 !docs/WM4A.md
+!docs/spec_qwen3_vl_pi_libero_4in1_30k.md
+!docs/spec_qwen3_vl_pi_libero_4in1_30k_h8_r8_gb128.md
 
 
 logs/*

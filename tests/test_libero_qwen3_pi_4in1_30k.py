@@ -154,15 +154,41 @@ def test_train_config_and_launcher_contract(monkeypatch):
     assert '--num_processes "${total_processes}"' in source
     assert '--machine_rank "${node_rank}"' in source
     assert '--trainer.gradient_accumulation_steps "${gradient_accumulation}"' in source
+    assert "unset WORLD_SIZE RANK LOCAL_RANK LOCAL_WORLD_SIZE MASTER_ADDR MASTER_PORT" in source
+    assert "validate-checkpoint" in source
     subprocess.run(["bash", "-n", launcher], check=True, env=os.environ)
-    subprocess.run(
-        ["bash", "-n", ROOT / "examples/simBenchmarks/LIBERO/eval_files/qwen3_pi_4in1_30k_eval.sh"],
-        check=True,
-        env=os.environ,
-    )
+    eval_launcher = ROOT / "examples/simBenchmarks/LIBERO/eval_files/qwen3_pi_4in1_30k_eval.sh"
+    eval_source = eval_launcher.read_text()
+    assert 'export PYTHONPATH="${repo}${PYTHONPATH:+:${PYTHONPATH}}"' in eval_source
+    assert "--config_override datasets.vla_data.obs_image_size=[224,224]" in eval_source
+    subprocess.run(["bash", "-n", eval_launcher], check=True, env=os.environ)
+    h8_launcher = TRAIN_FILES / "qwen3_pi_4in1_30k_h8_r8_gb128.sh"
+    h8_source = h8_launcher.read_text()
+    for expected in (
+        "QWEN3_PI_ACTION_HORIZON=8",
+        "QWEN3_PI_REPLAN_STEPS=8",
+        "QWEN3_PI_DATA_MIX=libero_all",
+        "QWEN3_PI_GLOBAL_BATCH_SIZE=128",
+        "GRADIENT_ACCUMULATION_STEPS=1",
+    ):
+        assert expected in h8_source
+    subprocess.run(["bash", "-n", h8_launcher], check=True, env=os.environ)
+    h8_eval = ROOT / "examples/simBenchmarks/LIBERO/eval_files/qwen3_pi_4in1_30k_h8_r8_gb128_eval.sh"
+    assert "QWEN3_PI_EVAL_PROFILE=h8_r8_gb128" in h8_eval.read_text()
+    subprocess.run(["bash", "-n", h8_eval], check=True, env=os.environ)
 
 
-def _make_gate_fixture(tmp_path, *, world_size=8, gradient_accumulation=4):
+def _make_gate_fixture(
+    tmp_path,
+    *,
+    eval_module=EVAL,
+    action_horizon=32,
+    replan_steps=24,
+    data_mix="libero_all_h32",
+    world_size=8,
+    gradient_accumulation=4,
+    global_batch=256,
+):
     run_dir = tmp_path / "run"
     checkpoint = run_dir / "checkpoints/steps_30000_pytorch_model.pt"
     checkpoint.parent.mkdir(parents=True)
@@ -173,7 +199,7 @@ def _make_gate_fixture(tmp_path, *, world_size=8, gradient_accumulation=4):
         "framework": {
             "action_model": {
                 "action_dim": 7,
-                "action_horizon": 32,
+                "action_horizon": action_horizon,
                 "repeated_diffusion_steps": 8,
                 "num_inference_timesteps": 4,
                 "diffusion_model_cfg": {"use_canonical_forward": False},
@@ -181,7 +207,8 @@ def _make_gate_fixture(tmp_path, *, world_size=8, gradient_accumulation=4):
         },
         "datasets": {
             "vla_data": {
-                "data_mix": "libero_all_h32",
+                "data_mix": data_mix,
+                "obs_image_size": [224, 224],
                 "per_device_batch_size": 8,
                 "include_state": False,
             }
@@ -192,28 +219,29 @@ def _make_gate_fixture(tmp_path, *, world_size=8, gradient_accumulation=4):
     validation = {
         "optimizer_step": 30000,
         "actions_finite": True,
-        "normalized_action_shape": [1, 32, 7],
-        "unnormalized_action_shape": [32, 7],
-        "weights_sha256": {"checkpoints/steps_30000_pytorch_model.pt": EVAL.sha256(checkpoint)},
-        "dataset_statistics_sha256": EVAL.sha256(stats),
+        "normalized_action_shape": [1, action_horizon, 7],
+        "unnormalized_action_shape": [action_horizon, 7],
+        "weights_sha256": {"checkpoints/steps_30000_pytorch_model.pt": eval_module.sha256(checkpoint)},
+        "dataset_statistics_sha256": eval_module.sha256(stats),
     }
     (run_dir / "checkpoint_validation.json").write_text(json.dumps(validation))
     event = {
-        "git_sha": EVAL.STARVLA_REVISION,
-        "model": {"revision": EVAL.QWEN_REVISION},
-        "datasets": {name: {"revision": revision} for name, revision in EVAL.DATASET_REVISIONS.items()},
+        "git_sha": eval_module.STARVLA_REVISION,
+        "model": {"revision": eval_module.QWEN_REVISION},
+        "datasets": {name: {"revision": revision} for name, revision in eval_module.DATASET_REVISIONS.items()},
+        "user_overrides": {"action_horizon": action_horizon, "replan_steps": replan_steps},
         "batch": {
             "per_device": 8,
             "world_size": world_size,
             "gradient_accumulation": gradient_accumulation,
-            "global": 256,
+            "global": global_batch,
         },
     }
     (run_dir / "run_manifest.json").write_text(json.dumps({"events": [event]}))
     return run_dir, checkpoint
 
 
-def test_checkpoint_gate_rejects_100k_and_accepts_30k(tmp_path):
+def test_checkpoint_gate_rejects_100k_and_accepts_30k(tmp_path, monkeypatch):
     run_dir, checkpoint = _make_gate_fixture(tmp_path)
     release = run_dir / "checkpoints/steps_100000_pytorch_model.pt"
     release.write_bytes(b"release")
@@ -224,6 +252,66 @@ def test_checkpoint_gate_rejects_100k_and_accepts_30k(tmp_path):
     assert gate["optimizer_step"] == 30000
     assert gate["checkpoint_sha256"] == EVAL.sha256(checkpoint)
     assert gate["starvla_source_revision"] == EVAL.STARVLA_REVISION
+
+    monkeypatch.setenv("QWEN3_PI_EVAL_PROFILE", "h8_r8_gb128")
+    spec = importlib.util.spec_from_file_location("qwen3_pi_4in1_30k_eval_h8", EVAL_FILE)
+    h8_eval = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(h8_eval)
+
+    valid_dir, valid_checkpoint = _make_gate_fixture(
+        tmp_path / "h8_valid",
+        eval_module=h8_eval,
+        action_horizon=8,
+        replan_steps=8,
+        data_mix="libero_all",
+        world_size=16,
+        gradient_accumulation=1,
+        global_batch=128,
+    )
+    assert h8_eval.checkpoint_gate(valid_dir, valid_checkpoint, valid_dir / "eval_gate.json")["complete"]
+
+    def reject(name, mutate):
+        run_dir, candidate = _make_gate_fixture(
+            tmp_path / name,
+            eval_module=h8_eval,
+            action_horizon=8,
+            replan_steps=8,
+            data_mix="libero_all",
+            world_size=16,
+            gradient_accumulation=1,
+            global_batch=128,
+        )
+        mutate(run_dir)
+        with pytest.raises(ValueError, match="contract"):
+            h8_eval.checkpoint_gate(run_dir, candidate, run_dir / "eval_gate.json")
+
+    def change_config(path, key, value):
+        config_path = path / "resolved_input_config.yaml"
+        config = OmegaConf.load(config_path)
+        OmegaConf.update(config, key, value)
+        OmegaConf.save(config, config_path)
+
+    def change_manifest(path, key, value):
+        manifest_path = path / "run_manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["events"][-1][key] = value
+        manifest_path.write_text(json.dumps(manifest))
+
+    reject("h8_bad_horizon", lambda path: change_config(path, "framework.action_model.action_horizon", 32))
+    reject("h8_bad_mix", lambda path: change_config(path, "datasets.vla_data.data_mix", "libero_all_h32"))
+    reject(
+        "h8_bad_replan",
+        lambda path: change_manifest(path, "user_overrides", {"action_horizon": 8, "replan_steps": 7}),
+    )
+    reject(
+        "h8_bad_batch",
+        lambda path: change_manifest(
+            path,
+            "batch",
+            {"per_device": 8, "world_size": 16, "gradient_accumulation": 1, "global": 256},
+        ),
+    )
 
 
 def test_checkpoint_gate_accepts_equivalent_two_node_batch(tmp_path):

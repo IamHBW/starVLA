@@ -9,13 +9,22 @@ tokens=/mnt/data/users/bowen/workspace/tokens.sh
 data_root=/mnt/data/users/bowen/workspace/data/starvla_libero_lerobot
 run_dir="${RUN_DIR:-/mnt/data/users/bowen/workspace/ckpt/qwen3_pi_libero4in1_30k}"
 config="${script_dir}/qwen3_pi_4in1_30k.yaml"
+action_horizon="${QWEN3_PI_ACTION_HORIZON:-32}"
+replan_steps="${QWEN3_PI_REPLAN_STEPS:-24}"
+data_mix="${QWEN3_PI_DATA_MIX:-libero_all_h32}"
+per_device_batch_size="${QWEN3_PI_PER_DEVICE_BATCH_SIZE:-8}"
+global_batch_size="${QWEN3_PI_GLOBAL_BATCH_SIZE:-256}"
+task_spec="${QWEN3_PI_TASK_SPEC:-${repo}/docs/spec_qwen3_vl_pi_libero_4in1_30k.md}"
+eval_launcher="${QWEN3_PI_EVAL_LAUNCHER:-${repo}/examples/simBenchmarks/LIBERO/eval_files/qwen3_pi_4in1_30k_eval.sh}"
+entry_launcher="${QWEN3_PI_ENTRY_LAUNCHER:-${BASH_SOURCE[0]}}"
 model_revision=ebb281ec70b05090aa6165b016eac8ec08e71b17
 starvla_base_revision=02861ead680ea648c367ed41cf0d0976581f0467
 model_snapshot="/mnt/data/users/bowen/workspace/outputs/model_cache/huggingface/hub/models--Qwen--Qwen3-VL-4B-Instruct/snapshots/${model_revision}"
 num_nodes="${NNODES:-${NUM_NODES:-1}}"
 gpus_per_node="${NUM_GPUS_PER_NODE:-${GPUS_PER_NODE:-8}}"
 gradient_accumulation="${GRADIENT_ACCUMULATION_STEPS:-4}"
-for value in "${num_nodes}" "${gpus_per_node}" "${gradient_accumulation}"; do
+for value in "${num_nodes}" "${gpus_per_node}" "${gradient_accumulation}" "${action_horizon}" \
+  "${replan_steps}" "${per_device_batch_size}" "${global_batch_size}"; do
   [[ "${value}" =~ ^[0-9]+$ ]] || { echo "Invalid distributed integer: ${value}" >&2; exit 2; }
 done
 host="${HOSTNAME:-$(hostname -s)}"
@@ -51,15 +60,20 @@ cd "${repo}"
 git merge-base --is-ancestor "${starvla_base_revision}" HEAD || { echo "Unexpected StarVLA base revision" >&2; exit 2; }
 [[ -x "${python_bin}" && -x "${accelerate_bin}" ]] || { echo "Missing StarVLA environment" >&2; exit 2; }
 [[ -f "${tokens}" && "$(stat -c %U "${tokens}")" == bowen ]] || { echo "Refusing credentials not owned by bowen" >&2; exit 2; }
-[[ -d "${data_root}" && -d "${model_snapshot}" && -f "${config}" ]] || { echo "Missing frozen input" >&2; exit 2; }
+[[ -d "${data_root}" && -d "${model_snapshot}" && -f "${config}" && -f "${task_spec}" && -x "${entry_launcher}" && -x "${eval_launcher}" ]] || { echo "Missing frozen input" >&2; exit 2; }
 for value in "${node_rank}" "${master_port}"; do
   [[ "${value}" =~ ^[0-9]+$ ]] || { echo "Invalid distributed integer: ${value}" >&2; exit 2; }
 done
 ((num_nodes >= 1 && gpus_per_node == 8 && node_rank < num_nodes)) || { echo "Invalid topology ${node_rank}/${num_nodes}x${gpus_per_node}" >&2; exit 2; }
+((action_horizon >= 1 && replan_steps >= 1 && replan_steps <= action_horizon)) || { echo "Invalid horizon/replan: ${action_horizon}/${replan_steps}" >&2; exit 2; }
 [[ "${run_dir}" == /mnt/data/users/bowen/workspace/ckpt/* && "${train_run_id}" != */* ]] || { echo "Invalid run destination: ${run_dir}" >&2; exit 2; }
-global_batch=$((8 * total_processes * gradient_accumulation))
-((global_batch == 256)) || { echo "Invalid global batch: 8 x ${total_processes} x ${gradient_accumulation} = ${global_batch}" >&2; exit 2; }
-echo "[qwen3-pi] host=${host} node_rank=${node_rank}/${num_nodes} master=${master_addr}:${master_port} world_size=${total_processes} per_device=8 accumulation=${gradient_accumulation} global_batch=${global_batch} run_dir=${run_dir}"
+global_batch=$((per_device_batch_size * total_processes * gradient_accumulation))
+((global_batch == global_batch_size)) || { echo "Invalid global batch: ${per_device_batch_size} x ${total_processes} x ${gradient_accumulation} = ${global_batch}, expected ${global_batch_size}" >&2; exit 2; }
+echo "[qwen3-pi] host=${host} node_rank=${node_rank}/${num_nodes} master=${master_addr}:${master_port} world_size=${total_processes} per_device=${per_device_batch_size} accumulation=${gradient_accumulation} global_batch=${global_batch} horizon=${action_horizon} replan=${replan_steps} mix=${data_mix} run_dir=${run_dir}"
+if ((node_rank == 0)) && [[ -z "${HTRAIN_JOB_ID:-}" && -n "${HTRAIN_JOB_NAME:-}" ]]; then
+  HTRAIN_JOB_ID="$(submit --status "${HTRAIN_JOB_NAME}" 2>/dev/null | awk '/^id:/ {print $2; exit}' || true)"
+  export HTRAIN_JOB_ID
+fi
 
 resume=false
 if [[ "${RESUME:-0}" == 1 ]]; then
@@ -108,7 +122,8 @@ preflight_done="${run_dir}/.preflight_done"
 preflight_failed="${run_dir}/.preflight_failed"
 if ((node_rank == 0)); then
   if ! "${python_bin}" - "${repo}" "${run_dir}" "${data_root}" "${model_snapshot}" "${config}" "${resume}" \
-    "${total_processes}" "${gradient_accumulation}" "${num_nodes}" "${gpus_per_node}" "${train_run_id}" "${run_root_dir}" <<'PY'
+    "${total_processes}" "${gradient_accumulation}" "${num_nodes}" "${gpus_per_node}" "${train_run_id}" "${run_root_dir}" \
+    "${action_horizon}" "${replan_steps}" "${per_device_batch_size}" "${global_batch_size}" "${data_mix}" <<'PY'
 import grp
 import hashlib
 import importlib.metadata
@@ -121,11 +136,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from omegaconf import OmegaConf
+from starVLA.dataloader.gr00t_lerobot.registry import DATASET_NAMED_MIXTURES, ROBOT_TYPE_CONFIG_MAP
 
 repo, run_dir, data_root, model, config = map(Path, sys.argv[1:6])
 resume = sys.argv[6] == "true"
 world_size, gradient_accumulation, num_nodes, gpus_per_node = map(int, sys.argv[7:11])
 train_run_id, run_root_dir = sys.argv[11:13]
+action_horizon, replan_steps, per_device_batch_size, global_batch_size = map(int, sys.argv[13:17])
+data_mix = sys.argv[17]
 expected = {
     "libero_spatial_no_noops_1.0.0_lerobot": ("bf14d6258218d12c2e3c1a3b9922e163cdf6455d", 432, 52970),
     "libero_object_no_noops_1.0.0_lerobot": ("15657dac2ad1c01b4e94bf54ab0493b46a8d63f9", 454, 66984),
@@ -198,15 +216,22 @@ assert (am["action_horizon"], am["repeated_diffusion_steps"], am["num_inference_
 assert am["diffusion_model_cfg"]["use_canonical_forward"] is False
 assert (vla["data_mix"], vla["per_device_batch_size"], vla["include_state"]) == ("libero_all_h32", 8, False)
 assert (trainer["max_train_steps"], trainer["gradient_accumulation_steps"], trainer["is_resume"]) == (30000, 4, False)
+am["action_horizon"] = action_horizon
+am["future_action_window_size"] = action_horizon - 1
+vla["data_mix"] = data_mix
+vla["per_device_batch_size"] = per_device_batch_size
 trainer["gradient_accumulation_steps"] = gradient_accumulation
 assert not trainer.get("pretrained_checkpoint") and trainer["freeze_modules"] == ""
-assert 8 * world_size * gradient_accumulation == 256
+mixture = DATASET_NAMED_MIXTURES[data_mix]
+assert len(mixture) == 4 and all(weight == 1.0 for _, weight, _ in mixture)
+assert all(ROBOT_TYPE_CONFIG_MAP[robot_type].action_indices == list(range(action_horizon)) for _, _, robot_type in mixture)
+assert per_device_batch_size * world_size * gradient_accumulation == global_batch_size
 OmegaConf.save(OmegaConf.create(resolved_cfg), run_dir / "resolved_input_config.yaml")
 
 ds = json.loads((repo / "starVLA/config/deepseeds/ds_config.yaml").read_text())
-ds["train_micro_batch_size_per_gpu"] = 8
+ds["train_micro_batch_size_per_gpu"] = per_device_batch_size
 ds["gradient_accumulation_steps"] = gradient_accumulation
-ds["train_batch_size"] = 256
+ds["train_batch_size"] = global_batch_size
 ds["zero_optimization"]["allgather_bucket_size"] = 100_000_000
 ds["zero_optimization"]["reduce_bucket_size"] = 100_000_000
 ds_path = run_dir / "resolved_deepspeed_config.json"
@@ -241,7 +266,8 @@ event = {
     "packages": packages,
     "gpu": run("nvidia-smi", "--query-gpu=name,memory.total,driver_version", "--format=csv,noheader"),
     "disk": run("df", "-h", "/mnt/data"),
-    "batch": {"per_device": 8, "world_size": world_size, "gradient_accumulation": gradient_accumulation, "global": 256},
+    "batch": {"per_device": per_device_batch_size, "world_size": world_size, "gradient_accumulation": gradient_accumulation, "global": global_batch_size},
+    "expected_action_shape": [per_device_batch_size, action_horizon, 7],
     "topology": {"nodes": num_nodes, "gpus_per_node": gpus_per_node},
     "memory_strategy": {
         "pytorch_cuda_alloc_conf": os.environ["PYTORCH_CUDA_ALLOC_CONF"],
@@ -250,7 +276,17 @@ event = {
         "reduce_bucket_size": ds["zero_optimization"]["reduce_bucket_size"],
     },
     "previous_failed_job_id": os.environ.get("PREVIOUS_JOB_ID"),
-    "user_overrides": {"action_horizon": 32, "replan_steps": 24},
+    "user_overrides": {"action_horizon": action_horizon, "replan_steps": replan_steps},
+    "shared_raw_source": {
+        "path": "/mnt/data/public_data/libero",
+        "owner": owner(Path("/mnt/data/public_data/libero")),
+        "suite_revisions": {name: revision for name, (revision, _, _) in expected.items()},
+    },
+    "htrain": {
+        "job_id": os.environ.get("HTRAIN_JOB_ID") or os.environ.get("JOB_ID") or os.environ.get("PET_TASK_ID"),
+        "job_name": os.environ.get("HTRAIN_JOB_NAME"),
+        "project": os.environ.get("HTRAIN_PROJECT"),
+    },
     "wandb": {"mode": os.environ["WANDB_MODE"], "entity": os.environ["WANDB_ENTITY"], "project": os.environ["WANDB_PROJECT"], "credentials": "/mnt/data/users/bowen/workspace/tokens.sh"},
 }
 manifest_path = run_dir / "run_manifest.json"
@@ -264,7 +300,9 @@ PY
   fi
   cp -f "${config}" "${run_dir}/source_config.yaml"
   cp -f "${BASH_SOURCE[0]}" "${run_dir}/source_launcher.sh"
-  cp -f "${repo}/docs/spec_qwen3_vl_pi_libero_4in1_30k.md" "${run_dir}/task_spec.md"
+  cp -f "${entry_launcher}" "${run_dir}/source_entry_launcher.sh"
+  cp -f "${eval_launcher}" "${run_dir}/source_eval_launcher.sh"
+  cp -f "${task_spec}" "${run_dir}/task_spec.md"
   touch "${preflight_done}"
 else
   for _ in {1..3600}; do
@@ -290,6 +328,9 @@ train_command=(
   --config_yaml "${config}"
   --run_root_dir "${run_root_dir}"
   --run_id "${train_run_id}"
+  --framework.action_model.action_horizon "${action_horizon}"
+  --datasets.vla_data.data_mix "${data_mix}"
+  --datasets.vla_data.per_device_batch_size "${per_device_batch_size}"
   --trainer.gradient_accumulation_steps "${gradient_accumulation}"
   --trainer.is_resume "${resume}"
 )
@@ -301,76 +342,12 @@ fi
 
 ((node_rank == 0)) || exit 0
 
-"${python_bin}" - "${run_dir}" "${data_root}" <<'PY'
-import hashlib
-import json
-import sys
-from pathlib import Path
-
-import av
-import numpy as np
-import torch
-from PIL import Image
-
-from deployment.model_server.policy_norm_processor import PolicyNormProcessor
-from starVLA.model.framework.base_framework import baseframework
-
-run_dir, data_root = map(Path, sys.argv[1:])
-checkpoint = run_dir / "checkpoints/steps_30000_pytorch_model.pt"
-if not checkpoint.is_file():
-    raise FileNotFoundError(checkpoint)
-
-model = baseframework.from_pretrained(str(checkpoint)).to(torch.bfloat16).cuda().eval()
-dataset = data_root / "libero_spatial_no_noops_1.0.0_lerobot"
-
-def first_frame(pattern):
-    path = next(dataset.glob(pattern))
-    with av.open(str(path)) as container:
-        return Image.fromarray(next(container.decode(video=0)).to_ndarray(format="rgb24"))
-
-task = json.loads((dataset / "meta/tasks.jsonl").read_text().splitlines()[0])["task"]
-example = {
-    "image": [
-        first_frame("videos/*/observation.images.image/*.mp4"),
-        first_frame("videos/*/observation.images.wrist_image/*.mp4"),
-    ],
-    "lang": task,
-}
-normalized = np.asarray(model.predict_action(examples=[example])["normalized_actions"])
-if normalized.shape != (1, 32, 7) or not np.isfinite(normalized).all():
-    raise RuntimeError(f"Invalid normalized action: shape={normalized.shape}")
-unnormalized = PolicyNormProcessor(str(checkpoint), unnorm_key="franka").unapply_actions(normalized[0])
-if unnormalized.shape != (32, 7) or not np.isfinite(unnormalized).all():
-    raise RuntimeError(f"Invalid unnormalized action: shape={unnormalized.shape}")
-
-def sha256(path):
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for chunk in iter(lambda: source.read(8 * 1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-weights = {}
-for step in (10000, 20000, 30000):
-    path = run_dir / f"checkpoints/steps_{step}_pytorch_model.pt"
-    if not path.is_file():
-        raise FileNotFoundError(path)
-    weights[str(path.relative_to(run_dir))] = sha256(path)
-progress = json.loads((run_dir / "checkpoints/full_state_step_30000/progress.json").read_text())
-if progress["optimizer_step"] != 30000 or progress["cumulative_train_samples"] != 30000 * 256:
-    raise RuntimeError(f"Invalid final progress: {progress}")
-result = {
-    "optimizer_step": 30000,
-    "checkpoint": str(checkpoint),
-    "weights_sha256": weights,
-    "dataset_statistics_sha256": sha256(run_dir / "dataset_statistics.json"),
-    "normalized_action_shape": list(normalized.shape),
-    "unnormalized_action_shape": list(unnormalized.shape),
-    "actions_finite": True,
-}
-(run_dir / "checkpoint_validation.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
-PY
+# The post-train gate is single-process; inherited HTrain variables would make
+# PartialState wait for the other training ranks after they have already exited.
+unset WORLD_SIZE RANK LOCAL_RANK LOCAL_WORLD_SIZE MASTER_ADDR MASTER_PORT GROUP_RANK ROLE_RANK ROLE_WORLD_SIZE
+"${python_bin}" "${repo}/examples/simBenchmarks/LIBERO/eval_files/qwen3_pi_4in1_30k_eval.py" \
+  validate-checkpoint --run-dir "${run_dir}" --data-root "${data_root}"
 
 if [[ "${RUN_EVAL_AFTER_TRAIN:-1}" == 1 ]]; then
-  RUN_DIR="${run_dir}" "${repo}/examples/simBenchmarks/LIBERO/eval_files/qwen3_pi_4in1_30k_eval.sh"
+  RUN_DIR="${run_dir}" "${eval_launcher}"
 fi

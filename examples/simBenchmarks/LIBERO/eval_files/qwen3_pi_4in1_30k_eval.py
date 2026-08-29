@@ -49,8 +49,19 @@ DATASET_REVISIONS = {
 STARVLA_REVISION = "02861ead680ea648c367ed41cf0d0976581f0467"
 QWEN_REVISION = "ebb281ec70b05090aa6165b016eac8ec08e71b17"
 PLUS_CLASSIFICATION_SHA256 = "faa87cce3e3ba434da01df7c77523a391b5f2912e4774330b0aa1be5f6a999e6"
-ACTION_HORIZON = 32
-REPLAN_STEPS = 24
+PROFILES = {
+    "h32_r24_gb256": {"action_horizon": 32, "replan_steps": 24, "global_batch": 256, "data_mix": "libero_all_h32"},
+    "h8_r8_gb128": {"action_horizon": 8, "replan_steps": 8, "global_batch": 128, "data_mix": "libero_all"},
+}
+PROFILE_NAME = os.environ.get("QWEN3_PI_EVAL_PROFILE", "h32_r24_gb256")
+try:
+    PROFILE = PROFILES[PROFILE_NAME]
+except KeyError as exc:
+    raise ValueError(f"unknown QwenPI evaluation profile: {PROFILE_NAME}") from exc
+ACTION_HORIZON = PROFILE["action_horizon"]
+REPLAN_STEPS = PROFILE["replan_steps"]
+GLOBAL_BATCH_SIZE = PROFILE["global_batch"]
+DATA_MIX = PROFILE["data_mix"]
 INFERENCE_STEPS = 4
 SEED = 7
 SETTLE_STEPS = 10
@@ -101,6 +112,68 @@ def sha256(path: str | Path) -> str:
     return digest.hexdigest()
 
 
+def validate_checkpoint(run_dir: str | Path, data_root: str | Path) -> dict:
+    """Strictly load the final model and prove it emits one finite action chunk."""
+    import av
+    import numpy as np
+    import torch
+    from PIL import Image
+
+    from deployment.model_server.policy_norm_processor import PolicyNormProcessor
+    from starVLA.model.framework.base_framework import baseframework
+
+    run_dir = Path(run_dir)
+    data_root = Path(data_root)
+    checkpoint = run_dir / "checkpoints/steps_30000_pytorch_model.pt"
+    if not checkpoint.is_file():
+        raise FileNotFoundError(checkpoint)
+
+    model = baseframework.from_pretrained(str(checkpoint)).to(torch.bfloat16).cuda().eval()
+    dataset = data_root / "libero_spatial_no_noops_1.0.0_lerobot"
+
+    def first_frame(pattern):
+        path = next(dataset.glob(pattern))
+        with av.open(str(path)) as container:
+            return Image.fromarray(next(container.decode(video=0)).to_ndarray(format="rgb24"))
+
+    task = json.loads((dataset / "meta/tasks.jsonl").read_text().splitlines()[0])["task"]
+    example = {
+        "image": [
+            first_frame("videos/*/observation.images.image/*.mp4"),
+            first_frame("videos/*/observation.images.wrist_image/*.mp4"),
+        ],
+        "lang": task,
+    }
+    normalized = np.asarray(model.predict_action(examples=[example])["normalized_actions"])
+    if normalized.shape != (1, ACTION_HORIZON, 7) or not np.isfinite(normalized).all():
+        raise RuntimeError(f"Invalid normalized action: shape={normalized.shape}")
+    unnormalized = PolicyNormProcessor(str(checkpoint), unnorm_key="franka").unapply_actions(normalized[0])
+    if unnormalized.shape != (ACTION_HORIZON, 7) or not np.isfinite(unnormalized).all():
+        raise RuntimeError(f"Invalid unnormalized action: shape={unnormalized.shape}")
+
+    weights = {}
+    for step in (10000, 20000, 30000):
+        path = run_dir / f"checkpoints/steps_{step}_pytorch_model.pt"
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        weights[str(path.relative_to(run_dir))] = sha256(path)
+    progress = json.loads((run_dir / "checkpoints/full_state_step_30000/progress.json").read_text())
+    if progress["optimizer_step"] != 30000 or progress["cumulative_train_samples"] != 30000 * GLOBAL_BATCH_SIZE:
+        raise RuntimeError(f"Invalid final progress: {progress}")
+    result = {
+        "optimizer_step": 30000,
+        "checkpoint": str(checkpoint),
+        "weights_sha256": weights,
+        "dataset_statistics_sha256": sha256(run_dir / "dataset_statistics.json"),
+        "normalized_action_shape": list(normalized.shape),
+        "unnormalized_action_shape": list(unnormalized.shape),
+        "actions_finite": True,
+    }
+    atomic_json(result, run_dir / "checkpoint_validation.json")
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return result
+
+
 def checkpoint_gate(run_dir: str | Path, checkpoint: str | Path, output: str | Path) -> dict:
     """Validate the exact 30K checkpoint and emit the immutable eval gate."""
     from omegaconf import OmegaConf
@@ -136,23 +209,25 @@ def checkpoint_gate(run_dir: str | Path, checkpoint: str | Path, output: str | P
         and action["repeated_diffusion_steps"] == 8
         and action["num_inference_timesteps"] == INFERENCE_STEPS
         and diffusion["use_canonical_forward"] is False
-        and vla["data_mix"] == "libero_all_h32"
+        and vla["data_mix"] == DATA_MIX
+        and vla["obs_image_size"] == [224, 224]
         and vla["per_device_batch_size"] == 8
         and vla["include_state"] is False
         and trainer["max_train_steps"] == 30000
         and batch.get("per_device") == vla["per_device_batch_size"]
         and batch.get("gradient_accumulation") == trainer["gradient_accumulation_steps"]
         and batch.get("world_size", 0) > 0
-        and batch["per_device"] * batch["world_size"] * batch["gradient_accumulation"] == 256
-        and batch.get("global") == 256
+        and batch["per_device"] * batch["world_size"] * batch["gradient_accumulation"] == GLOBAL_BATCH_SIZE
+        and batch.get("global") == GLOBAL_BATCH_SIZE
+        and event.get("user_overrides") == {"action_horizon": ACTION_HORIZON, "replan_steps": REPLAN_STEPS}
     )
     if not contract:
         raise ValueError("resolved training config violates the frozen eval contract")
     if validation.get("optimizer_step") != 30000 or validation.get("actions_finite") is not True:
         raise ValueError("checkpoint validation did not prove finite 30K inference")
-    if validation.get("normalized_action_shape") != [1, 32, 7]:
+    if validation.get("normalized_action_shape") != [1, ACTION_HORIZON, 7]:
         raise ValueError("unexpected normalized action shape")
-    if validation.get("unnormalized_action_shape") != [32, 7]:
+    if validation.get("unnormalized_action_shape") != [ACTION_HORIZON, 7]:
         raise ValueError("unexpected unnormalized action shape")
 
     checkpoint_hash = sha256(checkpoint)
@@ -194,6 +269,7 @@ def checkpoint_gate(run_dir: str | Path, checkpoint: str | Path, output: str | P
         "image_order": ["primary", "wrist"],
         "include_state": False,
         "training_batch": batch,
+        "profile": PROFILE_NAME,
     }
     atomic_json(gate, output)
     print(json.dumps(gate, indent=2, sort_keys=True))
@@ -212,6 +288,7 @@ def load_gate(path: str | Path) -> dict:
         "include_state": False,
         "starvla_revision": STARVLA_REVISION,
         "qwen_revision": QWEN_REVISION,
+        "profile": PROFILE_NAME,
     }
     for key, value in required.items():
         if gate.get(key) != value:
@@ -470,7 +547,7 @@ class StarAdapter:
         self.metadata = self.client.get_server_metadata()
         if self.metadata.get("action_chunk_size") != ACTION_HORIZON:
             raise ValueError(f"server action horizon mismatch: {self.metadata}")
-        if self.metadata.get("training_data_mix") != "libero_all_h32":
+        if self.metadata.get("training_data_mix") != DATA_MIX:
             raise ValueError(f"server data mix mismatch: {self.metadata}")
         if self.metadata.get("training_obs_image_size") != [224, 224]:
             raise ValueError(f"server image size mismatch: {self.metadata}")
@@ -813,6 +890,10 @@ def parse_args():
     parser = argparse.ArgumentParser()
     commands = parser.add_subparsers(dest="command", required=True)
 
+    validation = commands.add_parser("validate-checkpoint")
+    validation.add_argument("--run-dir", required=True)
+    validation.add_argument("--data-root", required=True)
+
     gate = commands.add_parser("checkpoint-gate")
     gate.add_argument("--run-dir", required=True)
     gate.add_argument("--checkpoint", required=True)
@@ -846,7 +927,9 @@ def parse_args():
 
 def main() -> None:
     args = parse_args()
-    if args.command == "checkpoint-gate":
+    if args.command == "validate-checkpoint":
+        validate_checkpoint(args.run_dir, args.data_root)
+    elif args.command == "checkpoint-gate":
         checkpoint_gate(args.run_dir, args.checkpoint, args.output)
     elif args.command == "build-manifest":
         write_manifest(args.dataset, args.mode, args.slots, args.gate, args.output)
