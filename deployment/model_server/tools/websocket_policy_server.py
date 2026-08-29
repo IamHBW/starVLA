@@ -3,6 +3,7 @@
 # Implemented by [Jinhui YE / HKUST University] in [2025].
 
 import asyncio
+import contextlib
 import logging
 import time
 import traceback
@@ -27,30 +28,52 @@ class WebsocketPolicyServer:
         port: int = 10093,
         idle_timeout: int = -1,  # Idle timeout in seconds, -1 means never auto-close
         metadata: dict | None = None,
+        max_batch_size: int = 1,
+        batch_wait_ms: float = 0,
     ) -> None:
+        if max_batch_size < 1:
+            raise ValueError("max_batch_size must be at least 1")
+        if batch_wait_ms < 0:
+            raise ValueError("batch_wait_ms must be non-negative")
         self._policy = policy  #
         self._host = host
         self._port = port
-        self._metadata = metadata or {}
+        self._metadata = {
+            **(metadata or {}),
+            "max_batch_size": max_batch_size,
+            "batch_wait_ms": batch_wait_ms,
+        }
         self._idle_timeout = idle_timeout
         self._last_active = time.time()
+        self._max_batch_size = max_batch_size
+        self._batch_wait_s = batch_wait_ms / 1000
+        self._inference_queue = asyncio.Queue()
         logging.getLogger("websockets.server").setLevel(logging.INFO)
 
     def serve_forever(self) -> None:
         asyncio.run(self.run())
 
     async def run(self):
-        async with websockets.asyncio.server.serve(
-            self._handler,
-            self._host,
-            self._port,
-            compression=None,
-            max_size=None,
-        ) as server:
-            if self._idle_timeout > 0:
-                await self._idle_watchdog(server)
-            else:
-                await server.serve_forever()
+        batch_worker = None
+        if self._max_batch_size > 1:
+            batch_worker = asyncio.create_task(self._batch_worker())
+        try:
+            async with websockets.asyncio.server.serve(
+                self._handler,
+                self._host,
+                self._port,
+                compression=None,
+                max_size=None,
+            ) as server:
+                if self._idle_timeout > 0:
+                    await self._idle_watchdog(server)
+                else:
+                    await server.serve_forever()
+        finally:
+            if batch_worker is not None:
+                batch_worker.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await batch_worker
 
     async def _idle_watchdog(self, server):
         """Monitor idle time and shut down the server on timeout."""
@@ -72,7 +95,10 @@ class WebsocketPolicyServer:
             try:
                 msg = msgpack_numpy.unpackb(await websocket.recv())
                 self._last_active = time.time()  # Refresh active time on each received message
-                ret = self._route_message(msg)  # route message
+                if self._max_batch_size > 1 and msg.get("type", "infer") in ("infer", "predict_action"):
+                    ret = await self._enqueue_inference(msg)
+                else:
+                    ret = self._route_message(msg)  # route message
                 await websocket.send(packer.pack(ret))
             except websockets.ConnectionClosed:
                 logging.info(f"Connection from {websocket.remote_address} closed")
@@ -84,6 +110,112 @@ class WebsocketPolicyServer:
                     reason="Internal server error. Traceback included in previous frame.",
                 )
                 raise
+
+    async def _enqueue_inference(self, msg: dict) -> dict:
+        future = asyncio.get_running_loop().create_future()
+        await self._inference_queue.put((msg, future))
+        return await future
+
+    async def _batch_worker(self) -> None:
+        while True:
+            first = await self._inference_queue.get()
+            items = [first]
+            deadline = asyncio.get_running_loop().time() + self._batch_wait_s
+            while len(items) < self._max_batch_size:
+                try:
+                    if self._batch_wait_s == 0:
+                        items.append(self._inference_queue.get_nowait())
+                    else:
+                        remaining = deadline - asyncio.get_running_loop().time()
+                        if remaining <= 0:
+                            break
+                        items.append(await asyncio.wait_for(self._inference_queue.get(), remaining))
+                except (asyncio.QueueEmpty, asyncio.TimeoutError):
+                    break
+            try:
+                self._route_inference_batches(items)
+            except Exception as exc:
+                logging.exception("Failed to route inference micro-batch")
+                for msg, future in items:
+                    if not future.done():
+                        future.set_result(
+                            {
+                                "status": "error",
+                                "ok": False,
+                                "type": "inference_result",
+                                "request_id": msg.get("request_id", "default"),
+                                "error": {"message": str(exc)},
+                            }
+                        )
+            finally:
+                for _ in items:
+                    self._inference_queue.task_done()
+
+    @staticmethod
+    def _slice_batch_value(value, start: int, end: int, total: int):
+        shape = getattr(value, "shape", ())
+        if shape and shape[0] == total:
+            return value[start:end]
+        if isinstance(value, (list, tuple)) and len(value) == total:
+            return value[start:end]
+        return value
+
+    def _route_inference_batches(self, items) -> None:
+        groups = {}
+        packer = msgpack_numpy.Packer()
+        for msg, future in items:
+            payload = msg.get("payload", msg)
+            examples = payload.get("examples") if isinstance(payload, dict) else None
+            if not isinstance(examples, list) or not examples:
+                if not future.done():
+                    future.set_result(self._route_message(msg))
+                continue
+            kwargs = {key: value for key, value in payload.items() if key != "examples"}
+            groups.setdefault(packer.pack(kwargs), []).append((msg, examples, kwargs, future))
+
+        for group in groups.values():
+            all_examples = []
+            spans = []
+            for msg, examples, _, future in group:
+                start = len(all_examples)
+                all_examples.extend(examples)
+                spans.append((msg, future, start, len(all_examples)))
+            try:
+                output = self._policy.predict_action(examples=all_examples, **group[0][2])
+                actions = output.get("actions") if isinstance(output, dict) else None
+                if not getattr(actions, "shape", ()) or actions.shape[0] != len(all_examples):
+                    raise ValueError("Batched policy output must have one action chunk per example")
+                for msg, future, start, end in spans:
+                    data = {
+                        key: self._slice_batch_value(value, start, end, len(all_examples))
+                        for key, value in output.items()
+                    }
+                    if not future.done():
+                        future.set_result(
+                            {
+                                "status": "ok",
+                                "ok": True,
+                                "type": "inference_result",
+                                "request_id": msg.get("request_id", "default"),
+                                "data": data,
+                            }
+                        )
+            except Exception as exc:
+                logging.exception(
+                    "Batched policy inference error (request_ids=%s)",
+                    [msg.get("request_id", "default") for msg, _, _, _ in spans],
+                )
+                for msg, future, _, _ in spans:
+                    if not future.done():
+                        future.set_result(
+                            {
+                                "status": "error",
+                                "ok": False,
+                                "type": "inference_result",
+                                "request_id": msg.get("request_id", "default"),
+                                "error": {"message": str(exc)},
+                            }
+                        )
 
     # route logic: recognize request from client
     def _route_message(self, msg: dict) -> dict:

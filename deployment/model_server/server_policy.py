@@ -63,6 +63,8 @@ def main(args) -> None:
         port=args.port,
         idle_timeout=args.idle_timeout,
         metadata=wrapper.metadata,
+        max_batch_size=args.max_batch_size,
+        batch_wait_ms=args.batch_wait_ms,
     )
     logging.info("server running ... metadata=%s", wrapper.metadata)
     server.serve_forever()
@@ -75,6 +77,8 @@ def build_argparser():
     parser.add_argument("--port", type=int, default=10093)
     parser.add_argument("--use_bf16", action="store_true")
     parser.add_argument("--idle_timeout", type=int, default=1800, help="Idle timeout in seconds, -1 means never close")
+    parser.add_argument("--max_batch_size", type=int, default=1, help="Maximum compatible requests per forward")
+    parser.add_argument("--batch_wait_ms", type=float, default=0, help="Time to wait for a micro-batch")
     parser.add_argument(
         "--config_override",
         action="append",
