@@ -2,6 +2,7 @@
 # Licensed under the MIT License, Version 1.0 (the "License");
 # Implemented by [Jinhui YE / HKUST University] in [2025].
 
+import inspect
 import logging
 import os
 import time
@@ -103,14 +104,16 @@ class WebsocketClientPolicy:
 
             try:
                 headers = {"Authorization": f"Api-Key {self._api_key}"} if self._api_key else None
+                keepalive = {}
+                if "ping_interval" in inspect.signature(websockets.sync.client.connect).parameters:
+                    keepalive = {"ping_interval": None, "ping_timeout": 60}
                 conn = websockets.sync.client.connect(
                     self._uri,
                     compression=None,
                     max_size=None,
                     additional_headers=headers,
                     open_timeout=150,
-                    ping_interval=None,
-                    ping_timeout=60,
+                    **keepalive,
                 )
                 metadata = msgpack_numpy.unpackb(conn.recv())
                 return conn, metadata
